@@ -1,0 +1,3288 @@
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"flag"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"math"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/smtp"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+var paused_consumption int64 = 50 //90 // 130
+var normal_consumption int64 = 3000
+
+// var to = []string{"Schadedaniel9@gmail.com", "aaronhoehnberg@gmail.com"}
+var message_fcrd_down = []byte("Automatic FCR information:\r\nFCRD-down has been activated")
+var message_fcrd_up = []byte("Automatic FCR information:\r\nFCRD-up has been activated")
+
+//"Subject: FCR Automated Power Breach Message\r\n" +
+//"\r\n" +
+//"The power meter has shown a power consumption of " + strconv.FormatFloat(fcr., 'f', -1, 64) + "\r\n")
+
+var transformer_cap = [6]float64{2300000, 2300000, 2300000, 2300000, 2300000, 2300000}
+
+const other_recorder = false
+const file_path_watt = ""
+const file_path_hz = ""
+
+// Boden
+const Boden = false
+
+//var meters = [...]string{"192.168.0.12", "192.168.0.13", "192.168.0.14", "192.168.0.15", "192.168.0.16", "192.168.0.17", "192.168.0.18", "192.168.0.19", "192.168.0.20", "192.168.0.21", "192.168.0.25", "192.168.0.26", "192.168.0.28"}
+//const meters_length = len(meters)
+
+// Utansjo
+var meters = [...]string{"10.200.6.11", "10.200.6.12", "10.200.6.13", "10.200.6.14"}
+
+const meters_length = len(meters)
+
+func calc_watt_fcrd_up_response_with_minimum_old(hz float64, watt_volume float64, minimum float64) float64 { // so the diffrence of watt_volume and minimum is what you can bid
+	return math.Max(math.Max(math.Min((hz-49.5)/0.4, 1), 0)*watt_volume, minimum)
+}
+
+func calc_watt_fcrd_up_response_with_minimum(hz float64, watt_volume float64, minimum float64) float64 { // so the diffrence of watt_volume and minimum is what you can bid
+	return math.Max(math.Min((hz-49.5)/0.4, 1), 0)*(watt_volume-minimum) + minimum
+}
+
+func calc_watt_fcrn_response_with_minimum(hz float64, watt_volume float64, minimum float64) float64 {
+	return math.Min(math.Max((hz-49.9)/0.2, 0), 1)*(watt_volume-minimum) + minimum
+}
+
+func calc_watt_fcrd_down_response_with_minimum_old(hz float64, watt_volume float64, minimum float64) float64 {
+	return math.Max(math.Max(math.Min((hz-50.1)/0.4, 1), 0)*watt_volume, minimum)
+}
+
+func calc_watt_fcrd_down_response_with_minimum(hz float64, watt_volume float64, minimum float64) float64 {
+	return math.Max(math.Min((hz-50.1)/0.4, 1), 0)*(watt_volume-minimum) + minimum
+}
+
+func get_current_dir() string {
+	ex, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	return filepath.Dir(ex)
+}
+
+func read_file(filename string) string {
+	file, err := os.Open(filename)
+	if err != nil {
+		return ""
+	}
+	b, err := io.ReadAll(file)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func read_email_address(filename string) []string {
+	f := read_file(filename)
+	var emails = []string{}
+	last_index := 0
+	for i := 0; i < len(f); i++ {
+		if f[i] == ',' || f[i] == ';' {
+			emails = append(emails, f[last_index:i])
+			last_index = i + 1
+		}
+	}
+	if last_index != len(f) {
+		emails = append(emails, f[last_index:])
+	}
+	return emails
+}
+
+func bool_to_string(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+func sign_to_float64_with_diff(f float64, d float64) float64 {
+	if f < -d {
+		return -1
+	}
+	if f > d {
+		return 1
+	}
+	return 0
+}
+
+func min_int(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func make_positive_float_over_length(s string, l int64) float64 {
+	for i := l - 1; i >= 0; i-- {
+		_, err := strconv.Atoi(s[i : i+1])
+		if err == nil {
+			erg, err2 := strconv.ParseFloat(s[:i+1], 64)
+			if err2 != nil {
+				fmt.Println("ERROR")
+			}
+			return erg
+		}
+	}
+	return -1
+}
+
+func ip_to_container(s string) int64 {
+	i, err := strconv.Atoi(s[8:10])
+	if err != nil {
+		fmt.Println("Error at getting container from ip")
+		return 0
+	}
+	return ((int64(i) - 40) % 2) + 1
+}
+
+func shuffle(slice []int) []int {
+	for i := range slice {
+		j := rand.Intn(i + 1)
+		slice[i], slice[j] = slice[j], slice[i]
+	}
+	return slice
+}
+
+var client_meter = http.Client{
+	Timeout: 3 * time.Second,
+}
+
+func get_meter_data(ip *string, watt *float64, hz *float64) bool {
+	r, err := client_meter.Get("http://" + (*ip) + "/api/v1/measurements")
+	if err != nil {
+		fmt.Println("Can't get power meter data at " + (*ip))
+		*watt = 0
+		*hz = 0
+		return false
+	}
+	defer r.Body.Close()
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		fmt.Println("Can't get power meter data at " + (*ip))
+		*watt = 0
+		*hz = 0
+		return false
+	}
+	body_string := string(body)
+	//fmt.Println(body_string)
+	ind := 3300 + strings.Index(body_string[3300:], "/p\"")
+	//fmt.Println(body_string[ind+32:ind+39], body_string[ind:ind+39])
+	//*watt, err = strconv.ParseFloat(body_string[ind+32:ind+39], 64)
+	watt_1 := make_positive_float_over_length(body_string[ind+32:ind+39], 7)
+	if watt_1 == -1 {
+		fmt.Println("Can't convert power meter data at " + (*ip))
+		*watt = 0
+		*hz = 0
+		return false
+	}
+	*watt = watt_1
+	ind = strings.Index(body_string, "/f\"")
+	//fmt.Println(body_string[ind+32:ind+38], "and:", body_string[ind:ind+39])
+	//*hz, err = strconv.ParseFloat(body_string[ind+32:ind+38], 64)
+	hz_1 := make_positive_float_over_length(body_string[ind+32:ind+38], 6)
+	if hz_1 == -1 {
+		fmt.Println("Can't convert hz meter data at " + (*ip))
+		*hz = 0
+		return false
+	}
+	*hz = hz_1
+	return true
+	// TODO: finish
+}
+
+func BytesFloat64(bytes []byte) float64 {
+	bits := binary.LittleEndian.Uint64(bytes)
+	float := math.Float64frombits(bits)
+	return float
+}
+
+func read_float64(f *os.File) (float64, bool) {
+	w := []byte{}
+	_, err := f.Read(w)
+	if err != nil {
+		return 0, false
+	}
+	if len(w) != 8 {
+		return 0, false
+	}
+	return BytesFloat64(w), true
+}
+
+func get_multiple_meter_data(ips *[meters_length]string, watt *float64, hz *float64, no_error_ *bool, single_meters_watt *[meters_length]float64, single_meters_no_error *[meters_length]bool) {
+	var w float64 = 0
+	var h float64 = 0
+	var watt_m float64
+	var hz_m float64
+	var no_error bool = true
+	if other_recorder == true {
+		var no_err bool
+		f, err := os.Open(file_path_hz)
+		if err != nil {
+			time.Sleep(time.Duration(rand.Intn(6)) * time.Millisecond)
+			f, err = os.Open(file_path_hz)
+			if err == nil {
+				*hz, no_err = read_float64(f)
+			}
+		} else {
+			*hz, no_err = read_float64(f)
+		}
+		no_error = no_error && no_err
+
+		f, err = os.Open(file_path_watt)
+		if err != nil {
+			time.Sleep(time.Duration(rand.Intn(6)) * time.Millisecond)
+			f, err = os.Open(file_path_watt)
+			if err == nil {
+				*watt, no_err = read_float64(f)
+			}
+		} else {
+			*watt, no_err = read_float64(f)
+		}
+		no_error = no_error && no_err
+		return
+	}
+	for i := 0; i < len(*ips); i++ {
+		single_meters_no_error[i] = get_meter_data(&(*ips)[i], &watt_m, &hz_m)
+		no_error = no_error && single_meters_no_error[i]
+		(*single_meters_watt)[i] = watt_m
+		w += watt_m
+		h = max(h, hz_m)
+	}
+	if h == 0 {
+		h = 50
+	}
+	*no_error_ = no_error
+	*watt = w
+	*hz = h
+}
+
+func get_normal_index(index uint64) uint64 {
+	return ((index % counting_length) + counting_length) % counting_length
+}
+
+func go_to_last_no_error(no_error_list *[counting_length]bool, counter uint64, counting_nr uint64, nothing_found *bool) uint64 {
+	for i := int64(1); i < int64(math.Min(float64(counting_nr+1), float64(counting_length))); i++ {
+		counter = get_normal_index(counter - 1)
+		if no_error_list[counter] {
+			return counter
+		}
+	}
+	*nothing_found = true
+	return 0
+}
+
+// for [counting_length][n]matrix looking at matrix[:][meters_index]
+func go_to_last_no_error_2d(no_error_list *[counting_length][meters_length]bool, counter uint64, counting_nr uint64, nothing_found *bool, meters_index uint64) uint64 {
+	for i := int64(1); i < int64(math.Min(float64(counting_nr+1), float64(counting_length))); i++ {
+		counter = get_normal_index(counter - 1)
+		if no_error_list[counter][meters_index] {
+			return counter
+		}
+	}
+	*nothing_found = true
+	return 0
+}
+
+const counting_length uint64 = 100000
+
+type Meter struct {
+	hz                   [counting_length]float64
+	watt                 [counting_length]float64
+	single_meters_watt   [counting_length][meters_length]float64
+	no_error             [counting_length]bool
+	no_error_meter       [counting_length][meters_length]bool
+	time_stamp           [counting_length]int64 // in milli seconds
+	ips                  [meters_length]string
+	counter              uint64 // where the new measurement will be inserted
+	informed_fcrd_up     bool
+	informed_fcrd_down   bool
+	inform_for_fcrd_up   bool
+	inform_for_fcrd_down bool
+	fcrd_up_over         bool
+	fcrd_down_over       bool
+	last_fcrd_down_act   time.Time
+	last_fcrd_up_act     time.Time
+	counting_nr          uint64
+}
+
+func (m *Meter) transformer_load(transformer int64) float64 {
+	if Boden {
+		if transformer == 3 {
+			return m.watt_now_meter(5) + m.watt_now_meter(6) + m.watt_now_meter(13)
+		}
+		return m.watt_now_meter(transformer*2-1) + m.watt_now_meter(transformer*2)
+	} else {
+		return m.watt_now_meter(1) + m.watt_now_meter(2) + m.watt_now_meter(3) + m.watt_now_meter(4)
+	}
+}
+
+const how_long_normal_till_new float64 = 15
+
+func (m *Meter) inform() {
+	hz := m.hz_now()
+	if m.inform_for_fcrd_down && hz > 50.1 && !m.informed_fcrd_down {
+		send_email_if_fcr_activation("fcrroottwo@gmail.com", "iozurzwekrzgmlss", read_email_address((get_current_dir() + "\\mail.txt")), message_fcrd_down)
+		m.informed_fcrd_down = true
+		m.last_fcrd_down_act = time.Now()
+	} else {
+		if m.informed_fcrd_down {
+			if hz > 50.1 {
+				m.last_fcrd_down_act = time.Now()
+			} else if time.Since(m.last_fcrd_down_act).Minutes() > how_long_normal_till_new {
+				m.informed_fcrd_down = false
+			}
+		}
+	}
+	if m.inform_for_fcrd_up && 0 < hz && hz < 49.9 && !m.informed_fcrd_up {
+		send_email_if_fcr_activation("fcrroottwo@gmail.com", "iozurzwekrzgmlss", read_email_address((get_current_dir() + "\\mail.txt")), message_fcrd_up)
+		m.informed_fcrd_up = true
+		m.last_fcrd_up_act = time.Now()
+	} else {
+		if m.informed_fcrd_up {
+			if 0 < hz && hz < 49.9 {
+				m.last_fcrd_up_act = time.Now()
+			} else if time.Since(m.last_fcrd_up_act).Minutes() > how_long_normal_till_new {
+				m.informed_fcrd_up = false
+			}
+		}
+	}
+}
+
+const sleep_time = 100
+
+func store(name string, content string) {
+	fi, err := os.Create(name + ".txt")
+	if err != nil {
+		fmt.Println("couldn't open")
+		return
+	}
+	_, err = fi.WriteString(content)
+	if err != nil {
+		fmt.Println("couldn't write")
+		return
+	}
+	err = fi.Close()
+	if err != nil {
+		fmt.Println("couldn't close")
+	}
+}
+
+func (m *Meter) start_tracking_and_document(kill_switch *bool) {
+	m.counting_nr = 0
+	var file_name string
+	if Boden {
+		file_name = "C:\\Users\\UtansjoMonitoring\\OneDrive - Digital Resource Holding\\Daily power measurements\\Boden_" + get_date() + ".txt"
+	} else {
+		file_name = "C:\\Users\\UtansjoMonitoring\\OneDrive - Digital Resource Holding\\Daily power measurements\\Utansjo_" + get_date() + ".txt"
+	}
+
+	fi, err := os.Create(file_name)
+	if err != nil {
+		fmt.Println("couldn't open")
+		return
+	}
+	fi.WriteString("time,watt,hz,no_error\n")
+	var counter int64 = 0
+	var ms_since int64 = 0
+	start := time.Now()
+	ts := time.Now()
+	day := start.Day()
+	current_day := day
+	for *kill_switch {
+		// TODO: implement
+		get_multiple_meter_data(&m.ips, &m.watt[m.counter], &m.hz[m.counter], &m.no_error[m.counter], &(m.single_meters_watt[m.counter]), &(m.no_error_meter[m.counter]))
+		ts = time.Now()
+		m.time_stamp[m.counter] = ts.UnixMilli()
+		current_day = ts.Day()
+		if current_day != day {
+			err = fi.Close()
+			if err != nil {
+				fmt.Println("couldn't close")
+				log.Println("couldn't close tracking file")
+			}
+			if Boden {
+				file_name = "C:\\Users\\UtansjoMonitoring\\OneDrive - Digital Resource Holding\\Daily power measurements\\Boden_" + get_date() + ".txt"
+			} else {
+				file_name = "C:\\Users\\UtansjoMonitoring\\OneDrive - Digital Resource Holding\\Daily power measurements\\Utansjo_" + get_date() + ".txt"
+			}
+			fi, err = os.Create(file_name)
+			if err != nil {
+				fmt.Println("couldn't open")
+				return
+			}
+			fi.WriteString("time,watt,hz,no_error\n")
+			day = current_day
+		}
+		fi.WriteString(strconv.Itoa(int(m.time_stamp[m.counter])) + "," + strconv.Itoa(int(m.watt[m.counter])) + "," + strconv.FormatFloat(m.hz[m.counter], 'f', -1, 64) + "," + bool_to_string(m.no_error[m.counter]) + "\n")
+		//fi.WriteString(strconv.Itoa(int(ms_since)) + "," + strconv.Itoa(int(get_multiple_meter(s))) + "\n")
+		m.counter = (m.counter + 1) % counting_length
+		//time.Sleep(sleep_time)
+		time.Sleep(time.Duration(counter*sleep_time-ms_since) * time.Millisecond)
+		ms_since = time.Since(start).Milliseconds() // time.Now().UnixMilli() //time.Since(start).Milliseconds()
+		m.inform()
+		counter++
+		m.counting_nr++
+	}
+	err = fi.Close()
+	if err != nil {
+		fmt.Println("couldn't close")
+	}
+}
+
+/*
+-d "{""type"": ""pause/resume"",""params"": {""mode"": ""fast""}}"
+curl -X "POST" "10.100.62.252/kaonsu/v1/miner_config" -H "accept: application/json" -H "Content-Type: application/json" -d "{""mode"": {""work-mode-selector"": ""Auto"", ""fixed"": {""frequency"": ""525"",""voltage"": 13.3}, ""concorde"": {""mode-select"": ""Percent"", ""percent"": 1, ""power-target"": 3700, ""hash-target"": 155}}}"
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+         "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+ <head>
+  <title>401 - Unauthorized</title>
+ </head>
+ <body>
+  <h1>401 - Unauthorized</h1>
+ </body>
+</html>
+
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+         "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+ <head>
+  <title>401 - Unauthorized</title>
+ </head>
+ <body>
+  <h1>401 - Unauthorized</h1>
+ </body>
+</html>
+*/
+
+func (m *Meter) moving_average_watt(precision uint64, min_length uint64, time_length int64) float64 {
+	if m.counting_nr < min_length {
+		return -1
+	}
+	time_from := time.Now().UnixMilli() - time_length
+	var included uint64 = 0
+	var erg float64 = 0
+	for i := uint64(1); i < counting_length+1; i += precision {
+		if m.time_stamp[get_normal_index(m.counter-i)] < time_from {
+			i = counting_length + 1
+		}
+		if m.no_error[get_normal_index(m.counter-i)] {
+			erg += m.watt[get_normal_index(m.counter-i)]
+			included++
+		}
+	}
+	if 0 == included {
+		return -1 // AKA Error TODO: check in every use if this error is handled
+	}
+	return erg / float64(included)
+}
+
+func (m *Meter) max(precision uint64, length uint64) float64 {
+	var erg float64 = -1
+	for i := uint64(1); i < length+1; i += precision {
+		if m.no_error[get_normal_index(m.counter-i)] {
+			erg = max(erg, m.watt[get_normal_index(m.counter-i)])
+		}
+	}
+	if erg == -1 {
+		return -1
+	}
+	return erg
+}
+
+func (m *Meter) min(precision uint64, length uint64) float64 {
+	var erg float64 = -1
+	for i := uint64(1); i < length+1; i += precision {
+		if m.no_error[get_normal_index(m.counter-i)] {
+			erg = max(erg, m.watt[get_normal_index(m.counter-i)])
+		}
+	}
+	if erg == -1 {
+		return -1
+	}
+	return erg
+}
+
+func (m *Meter) measurement_time() int64 {
+	nothing_found := false
+	ind := go_to_last_no_error(&m.no_error, m.counter, m.counting_nr, &nothing_found)
+	if nothing_found {
+		return -1
+	}
+	return m.time_stamp[ind]
+}
+
+func (m *Meter) hz_now() float64 {
+	nothing_found := false
+	ind := go_to_last_no_error(&m.no_error, m.counter, m.counting_nr, &nothing_found)
+	if nothing_found {
+		return -1
+	}
+	return m.hz[ind]
+}
+
+func (m *Meter) watt_now_meter(meter int64) float64 {
+	nothing_found := false
+	ind := go_to_last_no_error_2d(&m.no_error_meter, m.counter, m.counting_nr, &nothing_found, uint64(meter-1))
+	if nothing_found {
+		return -1
+	}
+	return m.single_meters_watt[ind][meter-1]
+}
+
+func (m *Meter) watt_now() float64 {
+	nothing_found := false
+	ind := go_to_last_no_error(&m.no_error, m.counter, m.counting_nr, &nothing_found)
+	if nothing_found {
+		return -1
+	}
+	return m.watt[ind]
+}
+
+type MaraMiner struct {
+	container             int64
+	transformer           int64
+	exists                bool
+	once_existed          bool
+	ip_address            string
+	status                string
+	miner_name            string
+	target_select         string
+	power_target          int64
+	overclocking_percent  int64
+	average_hash          float64
+	client                *http.Client // TODO: try this with just one client for all miners
+	status_get_client     *http.Request
+	curtail_client_sleep  *http.Request
+	curtail_client_resume *http.Request
+	ping_req              *http.Request
+	overview_req          *http.Request
+	last_use              time.Time
+	last_pause            time.Time
+	last_resume           time.Time
+	last_overclock        time.Time
+	last_existed          time.Time
+}
+
+func (m *MaraMiner) ready_to_resume() bool {
+	if m.exists && time.Since(m.last_pause).Seconds() > 20 {
+		return true
+	}
+	return false
+}
+
+func (m *MaraMiner) ready_to_pause() bool {
+	if m.exists && time.Since(m.last_resume).Seconds() > 20 {
+		return true
+	}
+	return false
+}
+
+func (m *MaraMiner) ready_to_overclock() bool {
+	if m.exists && time.Since(m.last_overclock).Minutes() > 15 {
+		return true
+	}
+	return false
+}
+
+func (m *MaraMiner) handle_error() {
+	m.exists = false
+	if m.once_existed {
+		m.last_existed = time.Now()
+		log.Println(m.ip_address, " error -> not existing anymore")
+	}
+}
+
+func (m *MaraMiner) get_miner_name_go(wg *sync.WaitGroup) {
+	defer (*wg).Done()
+	if m.exists {
+		req4, _ := http.NewRequest("GET", "http://"+m.ip_address+"/kaonsu/v1/overview", nil)
+		req4.Header.Set("accept", "application/json")
+		resp, err := m.client.Do(req4)
+		m.last_use = time.Now()
+		/*defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				fmt.Println("Error at get_miner_name_go Closing Body Error", m.ip_address)
+				m.handle_error()
+				return
+			}
+		}(resp.Body)*/
+		if err != nil {
+			fmt.Println("Error at get_miner_name_go ", m.ip_address)
+			m.handle_error()
+			return
+		}
+		body, err2 := ioutil.ReadAll(resp.Body)
+		if err2 != nil {
+			fmt.Println("Error reading response get_miner_name_go", m.ip_address)
+			m.handle_error()
+			return
+		}
+		body_s := string(body)
+		ind := strings.Index(body_s[10:], `"`)
+		if ind < 0 {
+			fmt.Println("Error finding name", m.ip_address)
+			m.handle_error()
+			return
+		}
+		m.miner_name = body_s[10 : 10+ind]
+	}
+}
+
+var fast_client = &http.Client{Timeout: 1 * time.Second}
+
+func (m *MaraMiner) update_existing() {
+	req3, _ := http.NewRequest("GET", "http://"+m.ip_address+"/kaonsu/v1/ping", nil)
+	req3.Header.Set("accept", "application/json")
+	resp, err := fast_client.Do(req3)
+	m.last_use = time.Now()
+	/*if resp.Body == nil {
+		fmt.Println("Error at update_existing_go Body not existing", m.ip_address)
+		m.handle_error()
+		return
+	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			fmt.Println("Error at update_existing_go Closing Body", m.ip_address)
+			m.handle_error()
+			return
+		}
+	}(resp.Body)*/
+	if err != nil {
+		fmt.Println("Error at update_existing ", m.ip_address)
+		m.handle_error()
+		return
+	}
+	body, err2 := ioutil.ReadAll(resp.Body)
+	if err2 != nil {
+		fmt.Println("Error reading response update_existing", m.ip_address)
+		m.handle_error()
+		return
+	}
+	if string(body) == "pong" {
+		m.exists = true
+		m.once_existed = true
+		m.get_current_watt_and_status()
+	}
+}
+
+func (m *MaraMiner) update_existing_go(wg *sync.WaitGroup) {
+	defer (*wg).Done()
+	req3, _ := http.NewRequest("GET", "http://"+m.ip_address+"/kaonsu/v1/ping", nil)
+	req3.Header.Set("accept", "application/json")
+	resp, err := m.client.Do(req3)
+	m.last_use = time.Now()
+	/*if resp.Body == nil {
+		fmt.Println("Error at update_existing_go Body not existing", m.ip_address)
+		m.handle_error()
+
+		return
+	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			fmt.Println("Error at update_existing_go Closing Body", m.ip_address)
+			m.handle_error()
+			return
+		}
+	}(resp.Body)*/
+	if err != nil {
+		fmt.Println("Error at update_existing_go ", m.ip_address)
+		m.handle_error()
+		return
+	}
+	body, err2 := ioutil.ReadAll(resp.Body)
+	if err2 != nil {
+		fmt.Println("Error reading response update_existing_go", m.ip_address)
+		m.handle_error()
+		return
+	}
+	if string(body) == "pong" {
+		m.exists = true
+		m.once_existed = true
+		m.get_current_watt_and_status()
+	}
+}
+
+func (m *MaraMiner) get_current_watt_and_status_go(wg *sync.WaitGroup) { // changed
+	defer (*wg).Done()
+	if m.exists {
+		req5, _ := http.NewRequest("GET", "http://"+m.ip_address+"/kaonsu/v1/brief", nil)
+		req5.Header.Set("accept", "application/json")
+		resp, err := m.client.Do(req5)
+		m.last_use = time.Now()
+		/*defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				fmt.Println("Error at get_current_watt_and_status_go Closing Body ", m.ip_address)
+				m.handle_error()
+				return
+			}
+		}(resp.Body)*/
+		if err != nil {
+			fmt.Println("Error at get_current_watt_and_status_go ", m.ip_address)
+			m.handle_error()
+			return
+		}
+		body, err2 := ioutil.ReadAll(resp.Body)
+		if err2 != nil {
+			fmt.Println("Error reading response get_current_watt_and_status_go", m.ip_address)
+			m.handle_error()
+			return
+		}
+		body_s := string(body)
+		if len(body_s) < 400 {
+			fmt.Println("Error not long enough response get_current_watt_and_status", m.ip_address)
+			m.handle_error()
+			return
+		}
+		ind := strings.Index(body_s[350:], "us")
+		if ind < 0 {
+			fmt.Println("Error finding status", m.ip_address)
+			m.handle_error()
+			return
+		}
+		m.status = body_s[ind+355 : ind+358]
+		if m.status == "Min" {
+			ind = strings.Index(body_s[200:], "r_c")
+			if ind == -1 {
+				fmt.Println("Error finding watt", m.ip_address) // TODO: look into the error that occured: Error finding watt 10.100.57.237, 10.100.57.220,
+				m.handle_error()
+				return
+			}
+			watt := make_positive_float_over_length(body_s[ind+225:ind+230], 4)
+			if watt == -1 {
+				fmt.Println("Error converting watt", m.ip_address, body_s[ind+215:ind+240])
+				m.handle_error()
+				return
+			}
+			m.power_target = int64(watt)
+		} else {
+			m.power_target = normal_consumption
+		}
+
+		//watt, err := strconv.ParseFloat(body_s[ind+225:ind+229], 64)
+		// TODO: This is not the power_target this is the current estimated consumption
+
+		ind = strings.Index(body_s, "rage")
+		if ind == -1 {
+			fmt.Println("Error finding hash", m.ip_address)
+			m.handle_error()
+			return
+		}
+		erg := make_positive_float_over_length(body_s[ind+6:ind+17], 8)
+		if erg == -1 {
+			fmt.Println("Error converting hash", m.ip_address)
+			m.handle_error()
+			return
+		}
+		m.average_hash = erg
+
+		return
+		m.power_target = normal_consumption
+	}
+}
+
+func (m *MaraMiner) get_current_watt_and_status() { // changed
+	if m.exists {
+		req5, _ := http.NewRequest("GET", "http://"+m.ip_address+"/kaonsu/v1/brief", nil)
+		req5.Header.Set("accept", "application/json")
+		resp, err := m.client.Do(req5)
+		m.last_use = time.Now()
+		/*defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				fmt.Println("Error at get_current_watt_and_status Closing", m.ip_address)
+				m.handle_error()
+				return
+			}
+		}(resp.Body)*/
+		if err != nil {
+			fmt.Println("Error at get_current_watt_and_status ", m.ip_address)
+			m.handle_error()
+			return
+		}
+		body, err2 := ioutil.ReadAll(resp.Body)
+		if err2 != nil {
+			fmt.Println("Error reading response get_current_watt_and_status", m.ip_address)
+			m.handle_error()
+			return
+		}
+		body_s := string(body)
+		if len(body_s) < 400 {
+			fmt.Println("Error not long enough response get_current_watt_and_status", m.ip_address)
+			m.handle_error()
+			return
+		}
+		ind := strings.Index(body_s[350:], "us")
+		if ind == -1 {
+			fmt.Println("Error finding status", m.ip_address)
+			m.handle_error()
+			return
+		}
+		m.status = body_s[ind+355 : ind+358]
+		ind = strings.Index(body_s[200:], "r_c")
+		if ind == -1 {
+			fmt.Println("Error finding watt", m.ip_address)
+			m.handle_error()
+			return
+		}
+		watt := make_positive_float_over_length(body_s[ind+225:ind+230], 4)
+		//watt, err := strconv.ParseFloat(body_s[ind+225:ind+229], 64)
+		if watt == -1 {
+			fmt.Println("Error converting watt", m.ip_address, body_s[ind+215:ind+240])
+			m.handle_error()
+			return
+		}
+		// TODO: This is not the power_target this is the current estimated consumption
+		m.power_target = int64(watt)
+		ind = strings.Index(body_s, "rage")
+		if ind == -1 {
+			fmt.Println("Error finding hash", m.ip_address)
+			m.handle_error()
+			return
+		}
+		erg := make_positive_float_over_length(body_s[ind+6:ind+17], 8)
+		if erg == -1 {
+			fmt.Println("Error converting hash", m.ip_address)
+			m.handle_error()
+			return
+		}
+		m.average_hash = erg
+		return
+		m.power_target = int64(normal_consumption)
+	}
+}
+
+func (m *MaraMiner) get_miner_config_go(wg *sync.WaitGroup) {
+	defer (*wg).Done()
+	if m.exists {
+		req, _ := http.NewRequest("GET", "http://"+m.ip_address+"/kaonsu/v1/miner_config", nil)
+		req.Header.Set("accept", "application/json")
+		resp, err := m.client.Do(req)
+		m.last_use = time.Now()
+		if err != nil {
+			fmt.Println("Error at get_current_watt_and_status ", m.ip_address)
+			m.handle_error()
+			return
+		}
+		body, err2 := ioutil.ReadAll(resp.Body)
+		if err2 != nil {
+			fmt.Println("Error reading response get_current_watt_and_status", m.ip_address)
+			m.handle_error()
+			return
+		}
+		body_s := string(body)
+		if len(body_s) < 1302 {
+			fmt.Println("Error not long enough response get_current_watt_and_status", m.ip_address)
+			m.handle_error()
+			return
+		}
+		ind := strings.Index(body_s[1300:], "lect\"")
+		if ind == -1 {
+			fmt.Println("Error finding target_select", m.ip_address)
+			m.handle_error()
+			return
+		}
+		m.target_select = body_s[1300+ind+7 : 1300+ind+10]
+
+		ind = strings.Index(body_s[1300:], "\"perc")
+		if ind == -1 {
+			fmt.Println("Error finding target_select", m.ip_address)
+			m.handle_error()
+			return
+		}
+		erg := make_positive_float_over_length(body_s[1300+ind+10:1300+ind+13], 3)
+		if erg == -1 {
+			fmt.Println("Error converting percent", m.ip_address)
+			m.handle_error()
+			return
+		}
+		m.overclocking_percent = int64(erg)
+	}
+}
+
+func (m *MaraMiner) reboot() {
+	fmt.Println("rebooting: ", m.ip_address)
+	var jsonStr = []byte(`{"type": "reboot"}`)
+	req, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/maintenance", bytes.NewBuffer(jsonStr))
+	req.Header.Set("accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.client.Do(req)
+	m.last_use = time.Now()
+	if err != nil {
+		fmt.Println("Error at reboot_go ", m.ip_address)
+		m.handle_error()
+		return
+	}
+	body, err2 := ioutil.ReadAll(resp.Body)
+	if err2 != nil {
+		fmt.Println("Error reading response", m.ip_address, err.Error())
+		m.handle_error()
+		return
+	}
+	if string(body)[22:24] != "OK" {
+		fmt.Println("Error at reboot_go ", m.ip_address, string(body))
+		m.handle_error()
+		return
+	}
+	m.last_use = time.Now()
+	// TODO: Do I have to change the Status to "Min" ?
+}
+
+func (m *MaraMiner) reboot_go(wg *sync.WaitGroup) {
+	defer (*wg).Done()
+	fmt.Println("rebooting: ", m.ip_address)
+	var jsonStr = []byte(`{"type": "reboot"}`)
+	req, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/maintenance", bytes.NewBuffer(jsonStr))
+	req.Header.Set("accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.client.Do(req)
+	m.last_use = time.Now()
+	/*defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			fmt.Println("Error at pause_go Closing Body", m.ip_address)
+			m.handle_error()
+			return
+		}
+	}(resp.Body)
+	*/
+	if err != nil {
+		fmt.Println("Error at reboot_go ", m.ip_address)
+		m.handle_error()
+		return
+	}
+	body, err2 := ioutil.ReadAll(resp.Body)
+	if err2 != nil {
+		fmt.Println("Error reading response", m.ip_address, err.Error())
+		m.handle_error()
+		return
+	}
+	if string(body)[22:24] != "OK" {
+		fmt.Println("Error at reboot_go ", m.ip_address, string(body))
+		m.handle_error()
+		return
+	}
+	m.last_use = time.Now()
+}
+
+func (m *MaraMiner) pause_go_name(wg *sync.WaitGroup, name string) { // changed
+	defer (*wg).Done()
+	if m.exists && m.miner_name == name {
+		if m.status == "Min" {
+			var jsonStr = []byte(`{"type": "pause", "params": {"mode": "fast"}}`)
+			req, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr))
+			req.Header.Set("accept", "application/json")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req)
+			m.last_use = time.Now()
+			defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					fmt.Println("Error at pause_go Closing Body", m.ip_address)
+					m.handle_error()
+					return
+				}
+			}(resp.Body)
+			if err != nil {
+				fmt.Println("Error at pause_go ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "OK" {
+				fmt.Println("Error at pause_go ", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.status = "Sle"
+			m.last_pause = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) resume_go_name(wg *sync.WaitGroup, name string) { // changed
+	defer (*wg).Done()
+	if m.exists && m.miner_name == name {
+		if m.status == "Sle" {
+			resp, err := m.client.Do(m.curtail_client_resume)
+			defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					fmt.Println("Error at resume_go Closing Body", m.ip_address)
+					m.handle_error()
+					return
+				}
+			}(resp.Body)
+			if err != nil {
+				fmt.Println("Error at resume_go ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response resume_go", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "OK" {
+				fmt.Println("Error at resume_go not OK", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.status = "Min"
+			m.last_use = time.Now()
+			m.last_resume = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) pause_go_slow(wg *sync.WaitGroup) { // changed
+	defer (*wg).Done()
+	if m.exists {
+		if m.status == "Min" {
+			var jsonStr = []byte(`{"type": "pause", "params": {"mode": "normal"}}`)
+			req, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr))
+			req.Header.Set("accept", "application/json")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req)
+			m.last_use = time.Now()
+			/*defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					fmt.Println("Error at pause_go Closing Body", m.ip_address)
+					m.handle_error()
+					return
+				}
+			}(resp.Body)
+			*/
+			if err != nil {
+				fmt.Println("Error at pause_go ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "OK" {
+				fmt.Println("Error at pause_go ", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.status = "Sle"
+			m.last_pause = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) resume_go_slow(wg *sync.WaitGroup) { // changed
+	defer (*wg).Done()
+	if m.exists {
+		if m.status == "Sle" {
+			var jsonStr2 = []byte(`{"type": "resume", "params": {"mode": "normal"}}`)
+			req2, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr2))
+			req2.Header.Set("accept", "application/json")
+			req2.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req2)
+			m.last_use = time.Now()
+			/*defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					fmt.Println("Error at resume_go Body Close", m.ip_address)
+					m.handle_error()
+					return
+				}
+			}(resp.Body)
+			*/
+			if err != nil {
+				fmt.Println("Error at resume_go ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response resume_go", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "OK" {
+				fmt.Println("Error at resume_go not OK", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.status = "Min"
+			m.last_resume = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) pause_go(wg *sync.WaitGroup) { // changed
+	defer (*wg).Done()
+	if m.exists {
+		if m.status == "Min" {
+			var jsonStr = []byte(`{"type": "pause", "params": {"mode": "fast"}}`)
+			req, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr))
+			req.Header.Set("accept", "application/json")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req)
+			m.last_use = time.Now()
+			/*defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					fmt.Println("Error at pause_go Closing Body", m.ip_address)
+					m.handle_error()
+					return
+				}
+			}(resp.Body)
+			*/
+			if err != nil {
+				fmt.Println("Error at pause_go ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "OK" {
+				fmt.Println("Error at pause_go ", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.status = "Sle"
+			m.last_pause = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) resume_go(wg *sync.WaitGroup) { // changed
+	defer (*wg).Done()
+	if m.exists {
+		if m.status == "Sle" {
+			var jsonStr2 = []byte(`{"type": "resume", "params": {"mode": "fast"}}`)
+			req2, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr2))
+			req2.Header.Set("accept", "application/json")
+			req2.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req2)
+			m.last_use = time.Now()
+			/*defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					fmt.Println("Error at resume_go Body Close", m.ip_address)
+					m.handle_error()
+					return
+				}
+			}(resp.Body)
+			*/
+			if err != nil {
+				fmt.Println("Error at resume_go ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response resume_go", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "OK" {
+				fmt.Println("Error at resume_go not OK", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.status = "Min"
+			m.last_resume = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) pause() {
+	if m.exists {
+		if m.status == "Min" {
+			var jsonStr = []byte(`{"type": "pause", "params": {"mode": "fast"}}`)
+			req, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr))
+			req.Header.Set("accept", "application/json")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req)
+			m.last_use = time.Now()
+			/*defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					fmt.Println("Error at pause_go Closing Body ", m.ip_address)
+					m.handle_error()
+					return
+				}
+			}(resp.Body)*/
+			if err != nil {
+				fmt.Println("Error at pause_go ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response pause_go", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "OK" {
+				fmt.Println("Error at pause_go not OK", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.status = "Sle"
+			m.last_use = time.Now()
+			m.last_pause = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) resume() {
+	if m.exists {
+		if m.status == "Sle" {
+			resp, err := m.client.Do(m.curtail_client_resume)
+			defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					fmt.Println("Error at resume Close Body", m.ip_address)
+					m.handle_error()
+					return
+				}
+			}(resp.Body)
+			if err != nil {
+				fmt.Println("Error at resume ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response resume", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "OK" {
+				fmt.Println("Error at resume not OK", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.status = "Min"
+			m.last_use = time.Now()
+			m.last_resume = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) overclock_percent_go(wg *sync.WaitGroup, percentage float64) {
+	defer (*wg).Done()
+	if m.exists {
+		if m.status == "Min" {
+			var jsonStr6 = []byte(`{"mode": {"work-mode-selector": "Auto", "fixed": {"frequency": "525","voltage": 13.3}, "concorde": {"mode-select": "Percent", "percent": ` + strconv.FormatFloat(percentage, 'f', -1, 64) + `, "power-target": 3700, "hash-target": 155}}}`)
+			req6, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/miner_config", bytes.NewBuffer(jsonStr6))
+			req6.Header.Set("accept", "application/json")
+			req6.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req6)
+			m.last_use = time.Now()
+			/*defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					m.handle_error()
+				}
+			}(resp.Body)*/
+			if err != nil {
+				fmt.Println("Error at resume ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response resume", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "su" {
+				fmt.Println("Error at resume not OK", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.last_overclock = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) overclock_percent(percentage float64) {
+	if m.exists {
+		if m.status == "Min" {
+			var jsonStr6 = []byte(`{"mode": {"work-mode-selector": "Auto", "fixed": {"frequency": "525","voltage": 13.3}, "concorde": {"mode-select": "Percent", "percent": ` + strconv.FormatFloat(percentage, 'f', -1, 64) + `, "power-target": 3700, "hash-target": 155}}}`)
+			req6, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/miner_config", bytes.NewBuffer(jsonStr6))
+			req6.Header.Set("accept", "application/json")
+			req6.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req6)
+			m.last_use = time.Now()
+			defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					m.handle_error()
+				}
+			}(resp.Body)
+			if err != nil {
+				fmt.Println("Error at resume ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response resume", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "su" {
+				fmt.Println("Error at resume not OK", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+			m.last_overclock = time.Now()
+		}
+	}
+}
+
+func (m *MaraMiner) overclock_freq_vol_go(wg *sync.WaitGroup, freq int64, vol float64) {
+	defer (*wg).Done()
+	if m.exists {
+		if m.status == "Min" {
+			var jsonStr6 = []byte(`{"mode": {"work-mode-selector": "Fixed", "fixed": {"frequency": "` + strconv.FormatInt(freq, 10) + `","voltage": ` + strconv.FormatFloat(vol, 'f', -1, 64) + `}, "concorde": {"mode-select": "Percent", "percent": 1.3, "power-target": 3700, "hash-target": 155}}}`)
+			req6, _ := http.NewRequest("POST", "http://"+m.ip_address+"/kaonsu/v1/miner_config", bytes.NewBuffer(jsonStr6))
+			req6.Header.Set("accept", "application/json")
+			req6.Header.Set("Content-Type", "application/json")
+			resp, err := m.client.Do(req6)
+			m.last_use = time.Now()
+			defer func(Body io.ReadCloser) {
+				err := Body.Close()
+				if err != nil {
+					m.handle_error()
+				}
+			}(resp.Body)
+			if err != nil {
+				fmt.Println("Error at resume ", m.ip_address)
+				m.handle_error()
+				return
+			}
+			body, err2 := ioutil.ReadAll(resp.Body)
+			if err2 != nil {
+				fmt.Println("Error reading response resume", m.ip_address, err.Error())
+				m.handle_error()
+				return
+			}
+			if string(body)[22:24] != "su" {
+				fmt.Println("Error at resume not OK", m.ip_address, string(body))
+				m.handle_error()
+				return
+			}
+		}
+	}
+}
+
+func (m *MaraMiner) diff_overclock(pct int64) float64 {
+	if m.status == "Min" && m.power_target != 0 && m.target_select == "Per" {
+		return float64(m.power_target * (pct - m.overclocking_percent))
+	}
+	return 0
+}
+
+func (m *MaraMiner) diff_pause() float64 {
+	// TODO: needs target watt
+	if m.power_target == 0 {
+		return float64(paused_consumption - normal_consumption)
+	}
+	if m.status == "Min" {
+		return float64(paused_consumption - m.power_target) // negative
+		//return float64(paused_consumption - 3000)
+	}
+	return 0
+}
+
+func (m *MaraMiner) diff_resume() float64 {
+	// TODO: needs target_watt
+	if m.power_target == 0 {
+		return float64(normal_consumption - paused_consumption)
+	}
+	if m.status == "Sle" {
+		return float64(m.power_target - paused_consumption) // positive
+		//return float64(3000 - paused_consumption)
+	}
+	return 0
+}
+
+const percent_levels_upper = 11
+const percent_levels_lower = 10
+
+type MaraManager struct {
+	miner_slice     []MaraMiner
+	paused_ind      []int
+	normal_ind      []int
+	stopped_ind     []int
+	meter_ips       [meters_length]string // TODO: maybe change to meter_ip class that if meter is not reachable the program will deviate to get estimated consumption
+	meters          Meter
+	percent_indices [percent_levels_upper + percent_levels_lower][100000]int // TODO: check if len(man.normal_ind) < 100000
+	percent_len     [percent_levels_upper + percent_levels_lower]int
+}
+
+func (man *MaraManager) count_each_container_running() [13]int64 {
+	how_many := [13]int64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	for i := 0; i < len(man.normal_ind); i++ {
+		how_many[man.miner_slice[man.normal_ind[i]].container-1] += 1
+	}
+	return how_many
+}
+
+func (man *MaraManager) count_running_container(container int64) int64 {
+	var counter int64 = 0
+	for i := 0; i < len(man.normal_ind); i++ {
+		if man.miner_slice[man.normal_ind[i]].container == container {
+			counter++
+		}
+	}
+	return counter
+}
+
+func (man *MaraManager) count_paused_container(container int64) int64 {
+	var counter int64 = 0
+	for i := 0; i < len(man.paused_ind); i++ {
+		if man.miner_slice[man.paused_ind[i]].container == container {
+			counter++
+		}
+	}
+	return counter
+}
+
+func (man *MaraManager) get_miner_names() {
+	var wg sync.WaitGroup
+	wg.Add(len(man.miner_slice))
+	for i := 0; i < len(man.miner_slice); i++ {
+		go man.miner_slice[i].get_miner_name_go(&wg)
+	}
+	wg.Wait()
+}
+
+func (man *MaraManager) print_how_many_types() { // needs a fresh status before
+	unique := []string{}
+	how_many := []uint32{}
+	var not_found bool
+	for i := 0; i < len(man.miner_slice); i++ {
+		not_found = true
+		if man.miner_slice[i].exists {
+			for j := 0; j < len(unique); j++ {
+				if unique[j] == man.miner_slice[i].miner_name {
+					how_many[j] += 1
+					not_found = false
+					j = len(unique)
+				}
+			}
+			if not_found {
+				unique = append(unique, man.miner_slice[i].miner_name)
+				how_many = append(how_many, 0)
+				not_found = true
+			}
+		}
+	}
+	for i := 0; i < len(unique); i++ {
+		fmt.Println(unique[i], " ", how_many[i])
+	}
+}
+
+func (man *MaraManager) reboot_container(container int64) {
+	for i := 0; i < len(man.paused_ind); i++ {
+		if man.miner_slice[man.paused_ind[i]].container == container {
+			man.miner_slice[man.paused_ind[i]].reboot()
+		}
+	}
+	for i := 0; i < len(man.normal_ind); i++ {
+		if man.miner_slice[man.normal_ind[i]].container == container {
+			man.miner_slice[man.normal_ind[i]].reboot()
+		}
+	}
+}
+
+func (man *MaraManager) reboot_ind(ind []int) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].reboot_go(&wg)
+	}
+	wg.Wait()
+	man.update_status()
+}
+
+func (man *MaraManager) reboot_red() []int {
+	ind_slice := []int{}
+	for i := 0; i < len(man.miner_slice); i++ {
+		if (man.miner_slice[i].average_hash < 20000 && man.miner_slice[i].status == "Min") || man.miner_slice[i].status == "Fat" {
+			ind_slice = append(ind_slice, i)
+		}
+	}
+	man.reboot_ind(ind_slice)
+	return ind_slice
+}
+
+func (man *MaraManager) handle_reds(killswitch *bool, every_hours int64) {
+	for *killswitch {
+		time.Sleep(time.Duration(every_hours)*time.Hour - 10*time.Minute)
+		ind := man.reboot_red()
+		log.Println("Rebooting reds: ", ind)
+		time.Sleep(10 * time.Minute)
+		man.update_existing_ind(ind)
+	}
+}
+
+func (man *MaraManager) check_resumed(killswitch *bool, pauseswitch *bool) {
+	for *killswitch {
+		for *pauseswitch {
+			for i := 0; i < len(man.miner_slice); i++ {
+				if man.miner_slice[i].exists && time.Since(man.miner_slice[i].last_use).Seconds() > 10 {
+					if man.miner_slice[i].status == "Min" {
+						man.miner_slice[i].get_current_watt_and_status()
+						if man.miner_slice[i].status == "Sle" {
+							fmt.Println("not resumed miner found: ", man.miner_slice[i].ip_address)
+							man.miner_slice[i].reboot()
+						}
+					} else if man.miner_slice[i].status == "Sle" {
+						man.miner_slice[i].get_current_watt_and_status()
+						if man.miner_slice[i].status == "Min" {
+							fmt.Println("not sleeping miner found: ", man.miner_slice[i].ip_address)
+							man.miner_slice[i].pause()
+						}
+					}
+					time.Sleep(1 * time.Second)
+				}
+			}
+		}
+		time.Sleep(1 * time.Minute)
+	}
+}
+
+func (man *MaraManager) update_existing_ind(ind []int) {
+	var wg sync.WaitGroup
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].update_existing_go(&wg)
+	}
+	wg.Wait()
+}
+
+func (man *MaraManager) update_existing() {
+	var wg sync.WaitGroup
+	wg.Add(len(man.miner_slice))
+	for i := 0; i < len(man.miner_slice); i++ {
+		go man.miner_slice[i].update_existing_go(&wg)
+	}
+	wg.Wait()
+}
+
+const update_rate = 100
+
+func (man *MaraManager) update_not_exisiting_go(kill_switch *bool) {
+	counter := 0
+	for *kill_switch {
+		if !man.miner_slice[counter].exists && !man.miner_slice[counter].once_existed {
+			man.miner_slice[counter].update_existing()
+			time.Sleep(update_rate)
+		}
+		counter = (counter + 1) % len(man.miner_slice)
+	}
+}
+
+const time_to_change_once_existed = 24
+
+func (man *MaraManager) update_once_exisiting_go(killswitch *bool) {
+	counter := 0
+	for *killswitch {
+		if !man.miner_slice[counter].exists && man.miner_slice[counter].once_existed {
+			man.miner_slice[counter].update_existing()
+			if !man.miner_slice[counter].exists && time.Since(man.miner_slice[counter].last_existed).Hours() > time_to_change_once_existed {
+				man.miner_slice[counter].once_existed = false
+			}
+			time.Sleep(update_rate)
+		}
+	}
+	counter = (counter + 1) % len(man.miner_slice)
+}
+
+func (man *MaraManager) get_status() {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(man.miner_slice))
+	for i := 0; i < len(man.miner_slice); i++ {
+		go man.miner_slice[i].get_current_watt_and_status_go(&wg)
+	}
+	wg.Wait()
+}
+
+func (man *MaraManager) get_miner_config() {
+	var wg sync.WaitGroup
+	wg.Add(len(man.miner_slice))
+	for i := 0; i < len(man.miner_slice); i++ {
+		go man.miner_slice[i].get_miner_config_go(&wg)
+	}
+	wg.Wait()
+}
+
+func (man *MaraManager) sort_use() {
+	sort.Slice(man.paused_ind, func(i, j int) bool {
+		return time.Since(man.miner_slice[man.paused_ind[i]].last_pause) > time.Since(man.miner_slice[man.paused_ind[j]].last_pause)
+	})
+	sort.Slice(man.normal_ind, func(i, j int) bool {
+		return time.Since(man.miner_slice[man.normal_ind[i]].last_resume) > time.Since(man.miner_slice[man.normal_ind[j]].last_resume)
+	})
+}
+
+func (man *MaraManager) update_status() {
+	//man.get_status()
+	man.paused_ind = []int{}
+	man.normal_ind = []int{}
+	man.stopped_ind = []int{}
+	for i := 0; i < len(man.miner_slice); i++ {
+		if man.miner_slice[i].exists {
+			switch man.miner_slice[i].status {
+			case "Sle":
+				man.paused_ind = append(man.paused_ind, i)
+			case "Min":
+				man.normal_ind = append(man.normal_ind, i)
+				//case "STO":
+				//	man.stopped_ind = append(man.stopped_ind, i)
+			}
+		}
+	}
+}
+
+func (man *MaraManager) update_overclocking() {
+	for i := 0; i < percent_levels_upper+percent_levels_lower; i++ {
+		man.percent_len[i] = 0
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < len(man.normal_ind); i++ {
+		if man.miner_slice[man.normal_ind[i]].overclocking_percent > percent_levels_upper {
+			wg.Add(1)
+			go man.miner_slice[man.normal_ind[i]].overclock_percent_go(&wg, percent_levels_upper-1)
+			man.percent_indices[percent_levels_upper-1+percent_levels_lower][man.percent_len[percent_levels_upper-1+percent_levels_lower]] = man.normal_ind[i]
+			man.percent_len[percent_levels_upper-1+percent_levels_lower]++
+		} else if man.miner_slice[man.normal_ind[i]].overclocking_percent < -percent_levels_lower {
+			wg.Add(1)
+			go man.miner_slice[man.normal_ind[i]].overclock_percent_go(&wg, -percent_levels_lower)
+			man.percent_indices[0][man.percent_len[0]] = man.normal_ind[i]
+			man.percent_len[0]++
+		} else {
+			man.percent_indices[man.miner_slice[man.normal_ind[i]].overclocking_percent+percent_levels_lower][man.percent_len[man.miner_slice[man.normal_ind[i]].overclocking_percent+percent_levels_lower]] = man.normal_ind[i]
+			man.percent_len[man.miner_slice[man.normal_ind[i]].overclocking_percent+percent_levels_lower]++
+		}
+	}
+	wg.Wait()
+}
+
+func (man *MaraManager) sum_average_hash() float64 {
+	var erg float64 = 0
+	for i := 0; i < len(man.miner_slice); i++ {
+		if man.miner_slice[i].exists {
+			erg += man.miner_slice[i].average_hash
+		}
+	}
+	return erg
+}
+
+func (man *MaraManager) sum_average_watt() int64 { // Keep in mind, this handles miners as if they were mining
+	var erg int64 = 0
+	for i := 0; i < len(man.miner_slice); i++ {
+		if man.miner_slice[i].exists {
+			erg += man.miner_slice[i].power_target
+		}
+	}
+	return erg
+}
+
+func (man *MaraManager) estimated_current_consumption() float64 {
+	// needs a fresh update_status call before, maybe change to iterate over all miners
+	// needs also a fresh get_watt call
+	//man.update_status()
+	var power float64 = 0
+	//fmt.Println("length: ", len(man.normal_ind))
+	for i := 0; i < len(man.normal_ind); i++ {
+		if man.miner_slice[man.normal_ind[i]].power_target == 0 {
+			power += 3000
+		} else {
+			power += float64(man.miner_slice[man.normal_ind[i]].power_target)
+		}
+	}
+	power += float64(int64(len(man.paused_ind)) * paused_consumption)
+	return power
+}
+
+func (man *MaraManager) pause_by_name(ind []int, name string) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].pause_go_name(&wg, name)
+	}
+	wg.Wait()
+	man.update_status()
+}
+
+func (man *MaraManager) resume_by_name(ind []int, name string) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].resume_go_name(&wg, name)
+	}
+	wg.Wait()
+	man.update_status()
+}
+
+func (man *MaraManager) pause_by_ind_slow(ind []int) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].pause_go_slow(&wg)
+	}
+	wg.Wait()
+	//man.update_status()
+}
+
+func (man *MaraManager) resume_by_ind_slow(ind []int) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].resume_go_slow(&wg)
+	}
+	wg.Wait()
+	//man.update_status()
+}
+
+func (man *MaraManager) pause_by_ind(ind []int) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].pause_go(&wg)
+	}
+	wg.Wait()
+	//man.update_status()
+}
+
+func (man *MaraManager) resume_by_ind(ind []int) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].resume_go(&wg)
+	}
+	wg.Wait()
+	//man.update_status()
+}
+
+func (man *MaraManager) pause_by_container(container int64, how_many int64) {
+	how_many = min(man.count_running_container(container), how_many)
+	var wg sync.WaitGroup
+	wg.Add(int(how_many))
+	man.normal_ind = shuffle(man.normal_ind)
+	for i := 0; i < len(man.normal_ind); i++ {
+		if man.miner_slice[man.normal_ind[i]].container == container {
+			go man.miner_slice[man.normal_ind[i]].pause_go(&wg)
+			how_many--
+			if how_many == 0 {
+				i = len(man.normal_ind)
+			}
+		}
+	}
+	wg.Wait()
+	man.update_status()
+}
+
+func (man *MaraManager) resume_by_container(container int64, how_many int64) {
+	how_many = min(man.count_paused_container(container), how_many)
+	var wg sync.WaitGroup
+	wg.Add(int(how_many))
+	man.paused_ind = shuffle(man.paused_ind)
+	for i := 0; i < len(man.paused_ind); i++ {
+		if man.miner_slice[man.paused_ind[i]].container == container {
+			go man.miner_slice[man.paused_ind[i]].resume_go(&wg)
+			how_many--
+			if how_many == 0 {
+				i = len(man.paused_ind)
+			}
+		}
+	}
+	wg.Wait()
+	man.update_status()
+}
+
+func (man *MaraManager) pause_number_of_miners_with_minimum_container(how_many int64, minimum int64) {
+	var wg sync.WaitGroup
+	running_per_container := man.count_each_container_running()
+	var how_many_over int64 = 0
+	for j := 0; j < 13; j++ {
+		how_many_over += max(running_per_container[j]-minimum, 0)
+	}
+	wg.Add(int(min(how_many_over, how_many)))
+	for i := 0; i < len(man.normal_ind); i++ {
+		if running_per_container[man.miner_slice[man.normal_ind[i]].container-1] > minimum {
+			go man.miner_slice[man.normal_ind[i]].pause_go(&wg)
+			running_per_container[man.miner_slice[man.normal_ind[i]].container-1] -= 1
+			how_many--
+			if how_many == 0 {
+				i = len(man.normal_ind)
+			}
+		}
+	}
+	wg.Wait()
+}
+
+func (man *MaraManager) comply_with_minimum(minimum int64) {
+	running_per_container := man.count_each_container_running()
+	var to_resume int64
+	for i := 1; i < 14; i++ {
+		if running_per_container[i-1] < minimum {
+			to_resume = minimum - running_per_container[i-1]
+			man.resume_by_container(int64(i), to_resume)
+			man.pause_number_of_miners_with_minimum_container(to_resume, minimum)
+		}
+	}
+}
+
+func (man *MaraManager) overclock_freq_vol(ind []int, freq int64, vol float64) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].overclock_freq_vol_go(&wg, freq, vol)
+	}
+	wg.Wait()
+}
+
+func (man *MaraManager) overclock_percent(ind []int, percent float64) {
+	var wg sync.WaitGroup // maybe change to only one wg per Manager
+	wg.Add(len(ind))
+	for i := 0; i < len(ind); i++ {
+		go man.miner_slice[ind[i]].overclock_percent_go(&wg, percent)
+	}
+	wg.Wait()
+}
+
+func (man *MaraManager) overclock_percent_slow(miner_at_a_time int, ind []int, percent float64) {
+	a := (len(ind) / miner_at_a_time) * miner_at_a_time
+	for i := 0; i < a; i += miner_at_a_time {
+		fmt.Println("overclock_percent_slow: ", ind[i:i+miner_at_a_time])
+		man.overclock_percent(ind[i:i+miner_at_a_time], percent)
+		time.Sleep(15 * time.Minute)
+	}
+	fmt.Println("overclock_percent_slow: ", ind[a:])
+	man.overclock_percent(ind[a:], percent)
+}
+
+func (man *MaraManager) set_max_prct_slow(miner_at_a_time int, percent_max float64) {
+	to_change := []int{}
+	for i := percent_levels_upper - 1; i > int(percent_max); i-- {
+		to_change = append(to_change, man.percent_indices[i+percent_levels_lower][:man.percent_len[i+percent_levels_lower]]...)
+	}
+	man.overclock_percent_slow(miner_at_a_time, to_change, percent_max)
+}
+
+func (man *MaraManager) add_consumption_overclock_perc_site_slowly(miner_at_a_time int, consumption float64) float64 { // returns how much consumption is left to achieve
+	left_transformer := [6]float64{}
+	for i := 0; i < 6; i++ {
+		left_transformer[i] = transformer_cap[i] - man.meters.transformer_load(int64(i-1))
+	}
+	to_change_ind := []int{}
+	if consumption < -2000 {
+		for i := percent_levels_upper - 1; i > 0; i-- {
+			diff_per_miner := float64(normal_consumption) / 100 * float64(i)
+			for j := 0; j < man.percent_len[i+percent_levels_lower]; j++ {
+				if man.miner_slice[man.percent_indices[i+percent_levels_lower][j]].ready_to_overclock() {
+					to_change_ind = append(to_change_ind, man.percent_indices[i+percent_levels_lower][j])
+				}
+			}
+			consumption += diff_per_miner
+			fmt.Println("underclocking from percent: ", i, diff_per_miner, to_change_ind)
+		}
+		man.overclock_percent_slow(miner_at_a_time, to_change_ind, 0)
+	} else if consumption > 2000 {
+		for i := 0; i < percent_levels_upper-1; i++ {
+			diff_per_miner := float64(normal_consumption) / 100.0 * float64(10-i)
+			for j := 0; j < man.percent_len[i+percent_levels_lower]; j++ {
+				if left_transformer[man.miner_slice[man.percent_indices[i+percent_levels_lower][j]].transformer] > diff_per_miner && man.miner_slice[man.percent_indices[i+percent_levels_lower][j]].ready_to_overclock() {
+					to_change_ind = append(to_change_ind, man.percent_indices[i+percent_levels_lower][j])
+				}
+			}
+			consumption -= diff_per_miner
+			fmt.Println("overclocking from percent: ", i, diff_per_miner, to_change_ind)
+		}
+		man.overclock_percent_slow(miner_at_a_time, to_change_ind, percent_levels_upper-1)
+	}
+	return consumption
+}
+
+func (man *MaraManager) keep_consumption(consumption float64, time_length int64, avg_precision uint64, avg_time_length_ms int64, consumption_precision_prct float64) {
+	start_time := time.Now()
+	var avg float64
+	var diff float64
+	for time.Since(start_time).Milliseconds() < time_length {
+		avg = man.meters.moving_average_watt(avg_precision, uint64(avg_time_length_ms)/sleep_time, avg_time_length_ms)
+		fmt.Println("Average consumption: ", avg, " Wanna be consumption: ", consumption)
+		if avg != -1 {
+			diff = consumption - avg
+			if math.Abs(diff) > consumption*consumption_precision_prct {
+				fmt.Println("To keep consumption adding: ", diff)
+				man.add_consumption(diff)
+			}
+		}
+		time.Sleep(2 * time.Duration(avg_time_length_ms) * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) keep_consumption_minimum(consumption float64, time_length int64, avg_precision uint64, avg_time_length_ms int64, consumption_precision_prct float64, minimum int64) {
+	start_time := time.Now()
+	var avg float64
+	var diff float64
+	for time.Since(start_time).Milliseconds() < time_length {
+		avg = man.meters.moving_average_watt(avg_precision, uint64(avg_time_length_ms)/sleep_time, avg_time_length_ms)
+		fmt.Println("Average consumption: ", avg, " Wanna be consumption: ", consumption)
+		if avg != -1 {
+			diff = consumption - avg
+			if math.Abs(diff) > consumption*consumption_precision_prct {
+				fmt.Println("To keep consumption adding: ", diff)
+				man.add_consumption_with_minimum(diff, minimum)
+			}
+		}
+		time.Sleep(2 * time.Duration(avg_time_length_ms) * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) keep_consumption_minimum_slow(consumption float64, time_length int64, avg_precision uint64, avg_time_length_ms int64, consumption_precision_prct float64, minimum int64) {
+	start_time := time.Now()
+	var avg float64
+	var diff float64
+	for time.Since(start_time).Milliseconds() < time_length {
+		avg = man.meters.moving_average_watt(avg_precision, uint64(avg_time_length_ms)/sleep_time, avg_time_length_ms)
+		fmt.Println("Average consumption: ", avg, " Wanna be consumption: ", consumption)
+		if avg != -1 {
+			diff = consumption - avg
+			if math.Abs(diff) > consumption*consumption_precision_prct {
+				fmt.Println("To keep consumption adding: ", diff)
+				man.add_consumption_with_minimum_slow(diff, minimum)
+			}
+		}
+		time.Sleep(2 * time.Duration(avg_time_length_ms) * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) keep_consumption_minimum_slow_overclocking(consumption float64, time_length int64, avg_precision uint64, avg_time_length_ms int64, consumption_precision_prct float64, minimum int64) {
+	start_time := time.Now()
+	var avg float64
+	var diff float64
+	for time.Since(start_time).Milliseconds() < time_length {
+		avg = man.meters.moving_average_watt(avg_precision, uint64(avg_time_length_ms)/sleep_time, avg_time_length_ms)
+		fmt.Println("Average consumption: ", avg, " Wanna be consumption: ", consumption)
+		if avg != -1 {
+			diff = consumption - avg
+			if math.Abs(diff) > consumption*consumption_precision_prct {
+				fmt.Println("To keep consumption adding: ", diff)
+				man.add_consumption_with_minimum_slow(diff, minimum)
+			}
+		}
+		time.Sleep(2 * time.Duration(avg_time_length_ms) * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) set_site_consumption_daily(manager ConsumptionManager) {
+	if manager.check_valid() {
+		fmt.Println("Not valid Consumption Manager")
+		return
+	}
+	//for time.Now()
+}
+
+func (man *MaraManager) set_consumption_smooth_distributed_containers(watt float64, minimum_miner int64) {
+	needed_diff := watt - man.estimated_current_consumption()
+	man.set_consumption_distributed_containers(man.estimated_current_consumption()+needed_diff*0.75, minimum_miner)
+	time.Sleep(60 * time.Second)
+	man.set_consumption_distributed_containers(watt, minimum_miner)
+}
+
+func (man *MaraManager) set_consumption_distributed_containers(watt float64, minimum_miner int64) {
+	needed_diff := watt - man.estimated_current_consumption()
+	fmt.Println("needed_diff: ", needed_diff)
+	var list_to_change = []int{}
+	if needed_diff > 2000 {
+		//fmt.Println("normal_ind: ", man.paused_ind)
+		man.paused_ind = shuffle(man.paused_ind)
+		for i := 0; i < len(man.paused_ind); i++ {
+			if man.miner_slice[man.paused_ind[i]].ready_to_resume() {
+				needed_diff -= man.miner_slice[man.paused_ind[i]].diff_resume()
+				list_to_change = append(list_to_change, man.paused_ind[i])
+			}
+			//fmt.Println(i, ": needed_diff ", needed_diff, " ", list_to_change, man.miner_slice[man.paused_ind[i]].exists, man.miner_slice[man.paused_ind[i]].ready_to_resume(), time.Since(man.miner_slice[man.paused_ind[i]].last_pause).Seconds())
+			if needed_diff < 2000 || i == len(man.paused_ind)-1 {
+				fmt.Println("to resume ", list_to_change)
+				//man.resume_by_ind(man.paused_ind[:i+1])
+				man.resume_by_ind(list_to_change)
+				i = len(man.paused_ind)
+			}
+		}
+	} else if needed_diff < -2000 {
+		//fmt.Println("normal_ind: ", man.normal_ind)
+		man.normal_ind = shuffle(man.normal_ind)
+		for i := 0; i < len(man.normal_ind); i++ {
+			if man.miner_slice[man.normal_ind[i]].ready_to_pause() && (man.count_running_container(man.miner_slice[man.normal_ind[i]].container) > minimum_miner) { // TODO: optimize that count_running_container is not called every time
+				needed_diff -= man.miner_slice[man.normal_ind[i]].diff_pause()
+				list_to_change = append(list_to_change, man.normal_ind[i])
+			}
+			//fmt.Println("needed_diff ", needed_diff)
+			if needed_diff > -2000 || i == len(man.normal_ind)-1 {
+				fmt.Println("to pause ", list_to_change)
+				//man.pause_by_ind(man.normal_ind[:i+1])
+				man.pause_by_ind(list_to_change)
+				i = len(man.normal_ind)
+			}
+		}
+	}
+	man.update_status()
+}
+
+func (man *MaraManager) set_consumption_distributed_containers_slow(watt float64, minimum_miner int64) {
+	needed_diff := watt - man.estimated_current_consumption()
+	fmt.Println("needed_diff: ", needed_diff)
+	var list_to_change = []int{}
+	if needed_diff > 2000 {
+		//fmt.Println("normal_ind: ", man.paused_ind)
+		man.paused_ind = shuffle(man.paused_ind)
+		for i := 0; i < len(man.paused_ind); i++ {
+			if man.miner_slice[man.paused_ind[i]].ready_to_resume() {
+				needed_diff -= man.miner_slice[man.paused_ind[i]].diff_resume()
+				list_to_change = append(list_to_change, man.paused_ind[i])
+			}
+			//fmt.Println(i, ": needed_diff ", needed_diff, " ", list_to_change, man.miner_slice[man.paused_ind[i]].exists, man.miner_slice[man.paused_ind[i]].ready_to_resume(), time.Since(man.miner_slice[man.paused_ind[i]].last_pause).Seconds())
+			if needed_diff < 2000 || i == len(man.paused_ind)-1 {
+				fmt.Println("to resume ", list_to_change)
+				//man.resume_by_ind(man.paused_ind[:i+1])
+				man.resume_by_ind_slow(list_to_change)
+				i = len(man.paused_ind)
+			}
+		}
+	} else if needed_diff < -2000 {
+		//fmt.Println("normal_ind: ", man.normal_ind)
+		man.normal_ind = shuffle(man.normal_ind)
+		for i := 0; i < len(man.normal_ind); i++ {
+			if man.miner_slice[man.normal_ind[i]].ready_to_pause() && (man.count_running_container(man.miner_slice[man.normal_ind[i]].container) > minimum_miner) { // TODO: optimize that count_running_container is not called every time
+				needed_diff -= man.miner_slice[man.normal_ind[i]].diff_pause()
+				list_to_change = append(list_to_change, man.normal_ind[i])
+			}
+			//fmt.Println("needed_diff ", needed_diff)
+			if needed_diff > -2000 || i == len(man.normal_ind)-1 {
+				fmt.Println("to pause ", list_to_change)
+				//man.pause_by_ind(man.normal_ind[:i+1])
+				man.pause_by_ind_slow(list_to_change)
+				i = len(man.normal_ind)
+			}
+		}
+	}
+	man.update_status()
+}
+
+var nr_paused = 0
+var nr_resumed = 0
+
+func (man *MaraManager) set_consumption(watt float64) { // TODO change this and below to check readiness
+	man.sort_use()
+	needed_diff := watt - man.estimated_current_consumption()
+	fmt.Println("needed_diff: ", needed_diff)
+	var list_to_change = []int{}
+	if needed_diff > 2000 {
+		//fmt.Println("normal_ind: ", man.paused_ind)
+		for i := 0; i < len(man.paused_ind); i++ {
+			if man.miner_slice[man.paused_ind[i]].ready_to_resume() {
+				fmt.Println(man.miner_slice[man.paused_ind[i]].ip_address, needed_diff, -man.miner_slice[man.paused_ind[i]].diff_resume())
+				needed_diff -= man.miner_slice[man.paused_ind[i]].diff_resume()
+				list_to_change = append(list_to_change, man.paused_ind[i])
+			}
+			//fmt.Println(i, ": needed_diff ", needed_diff, " ", list_to_change, man.miner_slice[man.paused_ind[i]].exists, man.miner_slice[man.paused_ind[i]].ready_to_resume(), time.Since(man.miner_slice[man.paused_ind[i]].last_pause).Seconds())
+			if needed_diff < 2000 || i == len(man.paused_ind)-1 {
+				fmt.Println("to resume ", list_to_change)
+				//man.resume_by_ind(man.paused_ind[:i+1])
+				man.resume_by_ind(list_to_change)
+				i = len(man.paused_ind)
+				nr_resumed += len(list_to_change)
+			}
+		}
+	} else if needed_diff < -2000 {
+		//fmt.Println("normal_ind: ", man.normal_ind)
+		for i := 0; i < len(man.normal_ind); i++ {
+			if man.miner_slice[man.normal_ind[i]].ready_to_pause() {
+				fmt.Println(man.miner_slice[man.normal_ind[i]].ip_address, needed_diff, -man.miner_slice[man.normal_ind[i]].diff_pause())
+				needed_diff -= man.miner_slice[man.normal_ind[i]].diff_pause()
+				list_to_change = append(list_to_change, man.normal_ind[i])
+			}
+			//fmt.Println("needed_diff ", needed_diff)
+			if needed_diff > -2000 || i == len(man.normal_ind)-1 {
+				fmt.Println("to pause ", list_to_change)
+				//man.pause_by_ind(man.normal_ind[:i+1])
+				man.pause_by_ind(list_to_change)
+				i = len(man.normal_ind)
+				nr_paused += len(list_to_change)
+			}
+		}
+	}
+	man.update_status()
+}
+
+func (man *MaraManager) add_consumption(consumption float64) {
+	var list_to_change = []int{}
+	if consumption < -2000 {
+		for i := 0; i < len(man.normal_ind); i++ {
+			if man.miner_slice[man.normal_ind[i]].ready_to_pause() {
+				fmt.Println(man.miner_slice[man.normal_ind[i]].ip_address, consumption, -man.miner_slice[man.normal_ind[i]].diff_pause())
+				list_to_change = append(list_to_change, man.normal_ind[i])
+				consumption -= man.miner_slice[man.normal_ind[i]].diff_pause()
+			}
+			if consumption > -2000 || i == len(man.normal_ind)-1 {
+				fmt.Println("to pause ", list_to_change)
+				man.pause_by_ind(list_to_change)
+				i = len(man.normal_ind)
+			}
+		}
+		return
+	}
+	if consumption > 2000 {
+		for i := 0; i < len(man.paused_ind); i++ {
+			if man.miner_slice[man.paused_ind[i]].ready_to_resume() {
+				fmt.Println(man.miner_slice[man.paused_ind[i]].ip_address, consumption, -man.miner_slice[man.paused_ind[i]].diff_pause())
+				list_to_change = append(list_to_change, man.paused_ind[i])
+				consumption -= man.miner_slice[man.paused_ind[i]].diff_resume()
+			}
+			if consumption < 2000 || i == len(man.paused_ind)-1 {
+				fmt.Println("to resume ", list_to_change)
+				man.resume_by_ind(list_to_change)
+				i = len(man.paused_ind)
+			}
+		}
+	}
+	man.update_status()
+}
+
+func (man *MaraManager) add_consumption_with_minimum(consumption float64, minimum_miner int64) {
+	var list_to_change = []int{}
+	if consumption < -2000 {
+		man.normal_ind = shuffle(man.normal_ind)
+		for i := 0; i < len(man.normal_ind); i++ {
+			if man.miner_slice[man.normal_ind[i]].ready_to_pause() && (man.count_running_container(man.miner_slice[man.normal_ind[i]].container) > minimum_miner) {
+				fmt.Println(man.miner_slice[man.normal_ind[i]].ip_address, consumption, -man.miner_slice[man.normal_ind[i]].diff_pause())
+				list_to_change = append(list_to_change, man.normal_ind[i])
+				consumption -= man.miner_slice[man.normal_ind[i]].diff_pause()
+			}
+			if consumption > -2000 || i == len(man.normal_ind)-1 {
+				fmt.Println("to pause ", list_to_change)
+				man.pause_by_ind(list_to_change)
+				i = len(man.normal_ind)
+			}
+		}
+	}
+	if consumption > 2000 {
+		man.paused_ind = shuffle(man.paused_ind)
+		for i := 0; i < len(man.paused_ind); i++ {
+			if man.miner_slice[man.paused_ind[i]].ready_to_resume() {
+				fmt.Println(man.miner_slice[man.paused_ind[i]].ip_address, consumption, -man.miner_slice[man.paused_ind[i]].diff_resume())
+				list_to_change = append(list_to_change, man.paused_ind[i])
+				consumption -= man.miner_slice[man.paused_ind[i]].diff_resume()
+			}
+			if consumption < 2000 || i == len(man.paused_ind)-1 {
+				fmt.Println("to resume ", list_to_change)
+				man.resume_by_ind(list_to_change)
+				i = len(man.paused_ind)
+			}
+
+		}
+	}
+	man.update_status()
+}
+
+func (man *MaraManager) add_consumption_with_minimum_slow(consumption float64, minimum_miner int64) {
+	var list_to_change = []int{}
+	if consumption < -2000 {
+		man.normal_ind = shuffle(man.normal_ind)
+		for i := 0; i < len(man.normal_ind); i++ {
+			if man.miner_slice[man.normal_ind[i]].ready_to_pause() && (man.count_running_container(man.miner_slice[man.normal_ind[i]].container) > minimum_miner) {
+				fmt.Println(man.miner_slice[man.normal_ind[i]].ip_address, consumption, -man.miner_slice[man.normal_ind[i]].diff_pause())
+				list_to_change = append(list_to_change, man.normal_ind[i])
+				consumption -= man.miner_slice[man.normal_ind[i]].diff_pause()
+			}
+			if consumption > -2000 || i == len(man.normal_ind)-1 {
+				fmt.Println("to pause ", list_to_change)
+				man.pause_by_ind_slow(list_to_change)
+				i = len(man.normal_ind)
+			}
+		}
+	}
+	if consumption > 2000 {
+		man.paused_ind = shuffle(man.paused_ind)
+		for i := 0; i < len(man.paused_ind); i++ {
+			if man.miner_slice[man.paused_ind[i]].ready_to_resume() {
+				fmt.Println(man.miner_slice[man.paused_ind[i]].ip_address, consumption, -man.miner_slice[man.paused_ind[i]].diff_resume())
+				list_to_change = append(list_to_change, man.paused_ind[i])
+				consumption -= man.miner_slice[man.paused_ind[i]].diff_resume()
+			}
+			if consumption < 2000 || i == len(man.paused_ind)-1 {
+				fmt.Println("to resume ", list_to_change)
+				man.resume_by_ind_slow(list_to_change)
+				i = len(man.paused_ind)
+			}
+
+		}
+	}
+	man.update_status()
+}
+
+func (man *MaraManager) add_consumption_with_minimum_slow_overclocking_with_transformer(consumption float64, minimum_miner int64) {
+	var list_to_change = []int{}
+
+	if consumption < -2000 {
+		// first clock down, then pause
+		man.normal_ind = shuffle(man.normal_ind)
+
+		for i := 0; i < len(man.normal_ind); i++ {
+			if man.miner_slice[man.normal_ind[i]].ready_to_pause() && (man.count_running_container(man.miner_slice[man.normal_ind[i]].container) > minimum_miner) {
+				fmt.Println(man.miner_slice[man.normal_ind[i]].ip_address, consumption, -man.miner_slice[man.normal_ind[i]].diff_pause())
+				list_to_change = append(list_to_change, man.normal_ind[i])
+				consumption -= man.miner_slice[man.normal_ind[i]].diff_pause()
+			}
+			if consumption > -2000 || i == len(man.normal_ind)-1 {
+				fmt.Println("to pause ", list_to_change)
+				man.pause_by_ind_slow(list_to_change)
+				i = len(man.normal_ind)
+			}
+		}
+	}
+	if consumption > 2000 {
+		// first resume, then overclock
+		man.paused_ind = shuffle(man.paused_ind)
+		for i := 0; i < len(man.paused_ind); i++ {
+			if man.miner_slice[man.paused_ind[i]].ready_to_resume() {
+				fmt.Println(man.miner_slice[man.paused_ind[i]].ip_address, consumption, -man.miner_slice[man.paused_ind[i]].diff_resume())
+				list_to_change = append(list_to_change, man.paused_ind[i])
+				consumption -= man.miner_slice[man.paused_ind[i]].diff_resume()
+			}
+			if consumption < 2000 || i == len(man.paused_ind)-1 {
+				fmt.Println("to resume ", list_to_change)
+				man.resume_by_ind_slow(list_to_change)
+				i = len(man.paused_ind)
+			}
+		}
+	}
+	man.update_status()
+}
+
+var watt_min_fcrn float64 = 1000000000 // arbitrary large number
+var time_min_fcrn = time.Now()
+var gradient_fcrn float64 = 0.6 // watt per microsecond, whereby it should be a value that 100% should be up running after 900000ms (15 min)
+var ms_since_fcrn float64 = 0
+var function_value_fcrn float64 = 1000000000 // arbitrary large number
+var time_last_n = time.Now()
+var no_use_yet bool = true
+
+func (man *MaraManager) count_ready_to_resume() int64 {
+	var a int64 = 0
+	for i := 0; i < len(man.paused_ind); i++ {
+		if man.miner_slice[man.paused_ind[i]].ready_to_resume() {
+			a++
+		}
+	}
+	return a
+}
+
+func (man *MaraManager) count_ready_to_pause() int64 {
+	var a int64 = 0
+	for i := 0; i < len(man.normal_ind); i++ {
+		if man.miner_slice[man.normal_ind[i]].ready_to_pause() {
+			a++
+		}
+	}
+	return a
+}
+
+/*
+func (man *MaraManager) multiplier(current_watt) float64 {
+
+}
+*/
+func (man *MaraManager) deriv_multi(watt_volume float64, watt_min_consumption float64, current_watt float64) float64 {
+	return math.Cos(math.Asin(2*((current_watt-watt_min_consumption)/(watt_volume-watt_min_consumption)) - 1))
+}
+
+func (man *MaraManager) fcrn_response(hz float64, watt_volume float64, watt_min_consumption float64, gradient_fcr float64) {
+	if hz != -1 {
+		if no_use_yet {
+			function_value_fcrn = man.estimated_current_consumption()
+			time_last_n = time.Now()
+			no_use_yet = false
+		}
+		current_watt := man.estimated_current_consumption()
+		current_watt_to_be := calc_watt_fcrn_response_with_minimum(hz, watt_volume, watt_min_consumption) // TODO: change that this takes a minimum watt value
+		ms_since_fcrn = float64(time.Since(time_last_n).Milliseconds())
+		function_value_fcrn = math.Max(watt_min_consumption, math.Min(watt_volume, ms_since_fcrn*sign_to_float64_with_diff(current_watt_to_be-function_value_fcrn, 2500)*gradient_fcr*man.deriv_multi(watt_volume, watt_min_consumption, function_value_fcrn)+function_value_fcrn))
+		time_last_n = time.Now()
+		man.set_consumption(function_value_fcrn)
+		fmt.Println("current watt: ", current_watt, "watt to be: ", current_watt_to_be, "function value: ", function_value_fcrn, "paused: ", len(man.paused_ind), man.count_ready_to_resume(), "normal: ", len(man.normal_ind), man.count_ready_to_pause(), "nr paused: ", nr_paused, "nr resumed: ", nr_resumed)
+	}
+}
+
+var watt_min float64 = 1000000000 // arbitrary large number
+var time_min = time.Now()
+var gradient float64 = 0.6 // watt per microsecond, whereby it should be a value that 100% should be up running after 900000ms (15 min)
+var ms_since int64 = 0
+var function_value float64 = 1000000000 // arbitrary large number
+
+func (man *MaraManager) static_fcrd_up_response(hz float64, watt_volume float64, watt_min_consumption float64, gradient_fcr float64) {
+	if hz != -1 {
+		current_watt := calc_watt_fcrd_up_response_with_minimum(hz, watt_volume, watt_min_consumption) // TODO: change that this takes a minimum watt value
+		ms_since = time.Since(time_min).Milliseconds()
+		function_value = watt_min + float64(ms_since)*gradient_fcr
+		if current_watt < function_value {
+			fmt.Println("smaller change: ", ms_since, " current watt: ", current_watt, " function", function_value)
+			watt_min = current_watt
+			time_min = time.Now()
+			man.set_consumption(watt_min)
+		} else {
+			fmt.Println("larger change: ", ms_since, " current watt: ", current_watt, " function", function_value)
+			man.set_consumption(function_value)
+		}
+	}
+}
+
+var watt_max_down float64 = -1000000000 // arbitrary large number
+var time_max_down = time.Now()
+var gradient_down float64 = 0.6 // watt per microsecond, whereby it should be a value that 100% should be up running after 900000ms (15 min)
+var ms_since_down int64 = 0
+var function_value_down float64 = -1000000000 // arbitrary large number
+
+func (man *MaraManager) static_mfrrcm_down_response(hz float64, watt_volume float64, watt_min_consumption float64, gradient_mfrrcm float64) {
+	if hz != -1 {
+		current_watt := calc_watt_fcrd_down_response_with_minimum(hz, watt_volume, watt_min_consumption) // TODO: change that this takes a minimum watt value
+		ms_since_down = time.Since(time_max_down).Milliseconds()
+		function_value_down = watt_max_down - float64(ms_since_down)*gradient_mfrrcm
+		if current_watt > function_value_down {
+			fmt.Println("smaller change: ", ms_since_down, " current watt: ", current_watt, " function", function_value_down)
+			watt_max_down = current_watt
+			time_max_down = time.Now()
+			man.set_consumption(watt_max_down)
+		} else {
+			fmt.Println("larger change: ", ms_since_down, " current watt: ", current_watt, " function", function_value_down)
+			man.set_consumption(function_value_down)
+		}
+	}
+}
+
+func (man *MaraManager) static_fcrd_up(watt_volume float64, watt_min_consumption float64, time_length_ms int64, gradient_fcr float64) {
+	start := time.Now()
+	for time.Since(start).Milliseconds() < time_length_ms {
+		man.static_fcrd_up_response(man.meters.hz_now(), watt_volume, watt_min_consumption, gradient_fcr)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) simulate_static_fcrd_up(watt_volume float64, watt_min_consumption float64, time_length int64, hz *float64, gradient_fcr float64) {
+	start := time.Now()
+	for time.Since(start).Milliseconds() < time_length {
+		man.static_fcrd_up_response(*hz, watt_volume, watt_min_consumption, gradient_fcr)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) static_mfrrcm_down(watt_volume float64, watt_min_consumption float64, time_length_ms int64, gradient_mfrr float64) {
+	start := time.Now()
+	for time.Since(start).Milliseconds() < time_length_ms {
+		man.static_mfrrcm_down_response(man.meters.hz_now(), watt_volume, watt_min_consumption, gradient_mfrr)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) simulate_static_mfrrcm_down(watt_volume float64, watt_min_consumption float64, time_length int64, hz *float64, gradient_mfrr float64) {
+	start := time.Now()
+	for time.Since(start).Milliseconds() < time_length {
+		man.static_mfrrcm_down_response(*hz, watt_volume, watt_min_consumption, gradient_mfrr)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) fcrn(watt_volume float64, watt_min_consumption float64, time_length int64, gradient_fcrn float64) {
+	start := time.Now()
+	nr_resumed = 0
+	nr_paused = 0
+	for time.Since(start).Milliseconds() < time_length {
+		man.fcrn_response(man.meters.hz_now(), watt_volume, watt_min_consumption, gradient_fcrn)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) simulate_fcrn(watt_volume float64, watt_min_consumption float64, time_length int64, hz *float64, gradient_fcrn float64) {
+	start := time.Now()
+	for time.Since(start).Milliseconds() < time_length {
+		man.fcrn_response(*hz, watt_volume, watt_min_consumption, gradient_fcrn)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) fcrn_sinus(watt_volume float64, watt_min_consumption float64, period float64, time_length int64, gradient_fcrn float64) {
+	start := time.Now()
+	for time.Since(start).Milliseconds() < time_length {
+		man.fcrn_response(50+0.1*math.Sin(2*math.Pi*float64(time.Since(start).Milliseconds())/period), watt_volume, watt_min_consumption, gradient_fcrn)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (man *MaraManager) test_static_linearity(watt_volume float64, watt_min_consumption float64, gradient_fcr float64) {
+	//meters := []string{"192.168.0.13", "192.168.0.14"} // TODO: change that to global variable
+	//go document_multiple_meter_go(&meters, 3005000)
+	hz1, hz2, hz3, hz4, hz5 := 49.9, 49.8, 49.7, 49.6, 49.5
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz1, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz2, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz3, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz4, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz5, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz4, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz3, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz2, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 300000, &hz1, gradient_fcr)
+}
+
+func (man *MaraManager) test_static_linearity_down(watt_volume float64, watt_min_consumption float64, gradient_fcr float64) {
+	//meters := []string{"192.168.0.13", "192.168.0.14"} // TODO: change that to global variable
+	//go document_multiple_meter_go(&meters, 3005000)
+	hz1, hz2, hz3, hz4, hz5 := 50.1, 50.2, 50.3, 50.4, 50.5
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz1, gradient_fcr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz2, gradient_fcr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz3, gradient_fcr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz4, gradient_fcr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz5, gradient_fcr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz4, gradient_fcr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz3, gradient_fcr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz2, gradient_fcr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 240000, &hz1, gradient_fcr)
+}
+
+func (man *MaraManager) test_static_fcrd_down_ramp_response(watt_volume float64, watt_min_consumption float64, gradient_mfrr float64) {
+	//meters := []string{"192.168.0.13", "192.168.0.14"} // TODO: change that to global variable
+	//go document_multiple_meter_go(&meters, 5270000)
+	hz1, hz3 := 50.1, 50.5
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 180000, &hz1, gradient_mfrr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 900000, &hz3, gradient_mfrr)
+
+	//man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 4440000, &hz2, gradient_mfrr)
+	man.simulate_static_mfrrcm_down(watt_volume, watt_min_consumption, 1200000, &hz1, gradient_mfrr)
+}
+
+func (man *MaraManager) test_static_fcrd_up_ramp_response(watt_volume float64, watt_min_consumption float64, gradient_fcr float64) {
+	//meters := []string{"192.168.0.13", "192.168.0.14"} // TODO: change that to global variable
+	//go document_multiple_meter_go(&meters, 2285000)
+	hz1, hz2 := 49.9, 49.5
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 180000, &hz1, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 900000, &hz2, gradient_fcr)
+	man.simulate_static_fcrd_up(watt_volume, watt_min_consumption, 1200000, &hz1, gradient_fcr)
+}
+
+func (man *MaraManager) test_mfrr_up(watt_volume float64, watt_min_consumption float64) {
+	man.set_consumption(watt_volume)
+	time.Sleep(900 * time.Second)
+	man.set_consumption(watt_min_consumption)
+	time.Sleep(3601 * time.Second)
+	man.set_consumption(watt_volume)
+	time.Sleep(900 * time.Second)
+}
+
+func (man *MaraManager) test_mfrr_down(watt_volume float64, watt_min_consumption float64) {
+	man.set_consumption(watt_min_consumption)
+	time.Sleep(900 * time.Second)
+	man.set_consumption(watt_volume)
+	time.Sleep(3601 * time.Second)
+	man.set_consumption(watt_min_consumption)
+	time.Sleep(900 * time.Second)
+}
+
+func (man *MaraManager) test_mfrr_down_slow(watt_volume float64, watt_min_consumption float64) {
+	man.set_consumption_distributed_containers_slow(watt_min_consumption, 40)
+	time.Sleep(600 * time.Second)
+	man.update_existing()
+	man.get_status()
+	man.update_status()
+	time.Sleep(5 * time.Second)
+	man.set_consumption_distributed_containers_slow(watt_volume, 40)
+	time.Sleep(1501 * time.Second)
+	man.update_existing()
+	man.get_status()
+	man.update_status()
+	time.Sleep(5 * time.Second)
+	man.set_consumption_distributed_containers_slow(watt_min_consumption, 40)
+	time.Sleep(900 * time.Second)
+}
+
+func (man *MaraManager) test_ffr(nor_ratio float64) {
+	nor := len(man.normal_ind)
+	pau := len(man.paused_ind)
+	actual_ratio := float64(nor) / (float64(nor) + float64(pau))
+	if actual_ratio > nor_ratio {
+		how_many_to_pause := int((actual_ratio - nor_ratio) * (float64(nor) + float64(pau)))
+		man.pause_by_ind(man.normal_ind[:how_many_to_pause])
+	} else {
+		how_many_to_resume := int((nor_ratio - actual_ratio) * (float64(nor) + float64(pau)))
+		man.resume_by_ind(man.paused_ind[:how_many_to_resume])
+	}
+	time.Sleep(5 * time.Minute)
+	man.update_status()
+	time_0 := time.Now()
+	go man.resume_by_ind(man.paused_ind)
+	time.Sleep(325 * time.Millisecond)
+	man.pause_by_ind(man.normal_ind)
+	time.Sleep(5 * time.Second)
+	man.update_status()
+	time.Sleep(5 * time.Minute)
+	man.resume_by_ind(man.paused_ind)
+	man.update_status()
+	fmt.Println(time_0.UnixMilli())
+	log.Println("Test FFR execution time", time_0.UnixMilli())
+	store("execution_time", strconv.Itoa(int(time_0.UnixMilli())))
+}
+
+func (man *MaraManager) test_ffr_2(nor_ratio float64) {
+	nor := len(man.normal_ind)
+	pau := len(man.paused_ind)
+	actual_ratio := float64(nor) / (float64(nor) + float64(pau))
+	if actual_ratio > nor_ratio {
+		how_many_to_pause := int((actual_ratio - nor_ratio) * (float64(nor) + float64(pau)))
+		man.pause_by_ind(man.normal_ind[:how_many_to_pause])
+	} else {
+		how_many_to_resume := int((nor_ratio - actual_ratio) * (float64(nor) + float64(pau)))
+		man.resume_by_ind(man.paused_ind[:how_many_to_resume])
+	}
+	time.Sleep(5 * time.Minute)
+	man.update_status()
+	time_0 := time.Now()
+	man.pause_by_ind(man.normal_ind)
+	time.Sleep(750 * time.Millisecond)
+	man.resume_by_ind(man.paused_ind)
+	time.Sleep(5 * time.Second)
+	man.update_status()
+	time.Sleep(5 * time.Minute)
+	man.resume_by_ind(man.paused_ind)
+	man.update_status()
+	fmt.Println(time_0.UnixMilli())
+	log.Println("Test FFR execution time", time_0.UnixMilli())
+	store("execution_time", strconv.Itoa(int(time_0.UnixMilli())))
+}
+
+func (man *MaraManager) test_ffr_3(nor_ratio float64, additional float64) {
+	nor := float64(len(man.normal_ind)) - additional
+	pau := float64(len(man.paused_ind)) - additional
+	actual_ratio := nor / (nor + pau)
+	if actual_ratio > nor_ratio {
+		how_many_to_pause := int((actual_ratio - nor_ratio) * (nor + pau))
+		man.pause_by_ind(man.normal_ind[:how_many_to_pause])
+	} else {
+		how_many_to_resume := int((nor_ratio - actual_ratio) * (nor + pau))
+		man.resume_by_ind(man.paused_ind[:how_many_to_resume])
+	}
+	time.Sleep(5 * time.Minute)
+	man.update_status()
+	time_0 := time.Now()
+	go man.resume_by_ind(man.paused_ind)
+	time.Sleep(300 * time.Millisecond)
+	go man.pause_by_ind(man.normal_ind[:len(man.normal_ind)-int(additional)])
+	time.Sleep(2800 * time.Millisecond)
+	man.pause_by_ind(man.normal_ind[len(man.normal_ind)-int(additional):])
+	time.Sleep(5 * time.Second)
+	man.update_status()
+	time.Sleep(5 * time.Minute)
+	man.resume_by_ind(man.paused_ind)
+	man.update_status()
+	fmt.Println(time_0.UnixMilli())
+	log.Println("Test FFR execution time", time_0.UnixMilli())
+	store("execution_time", strconv.Itoa(int(time_0.UnixMilli())))
+}
+
+func (man *MaraManager) test_ffr_simple(miner int, ip string) {
+	conn, err := net.Dial("tcp", ip+":1234")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	ts := time.Now()
+	ts_till := time.Now().UnixMilli() + 10000
+	for ts.UnixMilli() < ts_till {
+		conn.Write([]byte(strconv.FormatFloat(50, 'f', -1, 64) + "\n"))
+		ts = time.Now()
+		time.Sleep(100 * time.Millisecond)
+	}
+	go man.pause_by_ind(man.normal_ind[:int(math.Min(float64(len(man.normal_ind)), float64(miner)))])
+	ts_till = time.Now().UnixMilli() + 230000
+	for ts.UnixMilli() < ts_till {
+		conn.Write([]byte(strconv.FormatFloat(49.5, 'f', -1, 64) + "\n"))
+		ts = time.Now()
+		time.Sleep(100 * time.Millisecond)
+	}
+	ts_till = time.Now().UnixMilli() + 10000
+	for ts.UnixMilli() < ts_till {
+		conn.Write([]byte(strconv.FormatFloat(49.5, 'f', -1, 64) + "\n"))
+		ts = time.Now()
+		time.Sleep(100 * time.Millisecond)
+	}
+	ts_till = time.Now().UnixMilli() + 600000
+	for ts.UnixMilli() < ts_till {
+		conn.Write([]byte(strconv.FormatFloat(50, 'f', -1, 64) + "\n"))
+		ts = time.Now()
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+type ConsumptionManager struct {
+	dates       []time.Time // 2024 11 18 23 00, 2024 11 19 00 00		has to be increasing
+	consumption []float64   // 11.9
+}
+
+func (con *ConsumptionManager) check_valid() bool {
+	if len(con.dates) != len(con.consumption)-1 {
+		return false
+	}
+	for i := 0; i < len(con.dates)-1; i++ {
+		if con.dates[i+1].Before(con.dates[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (con *ConsumptionManager) get_consumtpion(t time.Time) float64 {
+	for i := 0; i < len(con.dates)-1; i++ {
+		if con.dates[i+1].Before(t) && t.Before(con.dates[i]) {
+
+		}
+	}
+	return 0
+}
+
+func create_mara_miners_slice(first_from []int, first_till []int, second_from []int, second_till []int) []MaraMiner {
+	length := 0
+	for i := 0; i < len(first_from); i++ {
+		length += (first_till[i] - first_from[i] + 1) * (second_till[i] - second_from[i] + 1)
+	}
+	miners := make([]MaraMiner, length)
+	indexer := 0
+	for i := 0; i < len(first_from); i++ {
+		for j := first_from[i]; j <= first_till[i]; j++ {
+			for k := second_from[i]; k <= second_till[i]; k++ {
+				miner := MaraMiner{}
+				if Boden {
+					miner.ip_address = "10.100." + strconv.Itoa(j) + "." + strconv.Itoa(k) // Boden
+					if j == 62 || j == 63 {
+						miner.container = 12
+						miner.transformer = 6
+					} else {
+						miner.container = ((int64(j) - 100) / 4) + 1 // new Boden
+						if miner.container == 13 {
+							miner.transformer = 3
+						} else {
+							miner.transformer = (miner.container-1)/2 + 1
+						}
+					}
+				} else {
+					miner.ip_address = "10.200." + strconv.Itoa(j) + "." + strconv.Itoa(k) // Utansjo
+					miner.container = ((int64(j) - 40) / 8) + 1                            // Utansjo
+					miner.transformer = 1
+				}
+				var jsonStr = []byte(`{"type": "pause", "params": {"mode": "fast"}}`)
+				req, _ := http.NewRequest("POST", "http://"+miner.ip_address+"/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr))
+				req.Header.Set("accept", "application/json")
+				req.Header.Set("Content-Type", "application/json")
+				var jsonStr2 = []byte(`{"type": "resume", "params": {"mode": "fast"}}`)
+				req2, _ := http.NewRequest("POST", "http://"+miner.ip_address+"/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr2))
+				req2.Header.Set("accept", "application/json")
+				req2.Header.Set("Content-Type", "application/json")
+
+				req3, _ := http.NewRequest("GET", "http://"+miner.ip_address+"/kaonsu/v1/ping", nil)
+				req3.Header.Set("accept", "application/json")
+				req4, _ := http.NewRequest("GET", "http://"+miner.ip_address+"/kaonsu/v1/overview", nil)
+				req4.Header.Set("accept", "application/json")
+				req5, _ := http.NewRequest("GET", "http://"+miner.ip_address+"/kaonsu/v1/brief", nil)
+				req5.Header.Set("accept", "application/json")
+				miner.overview_req = req4
+				miner.status_get_client = req5
+				miner.curtail_client_resume = req2
+				miner.curtail_client_sleep = req
+				miner.ping_req = req3
+				miner.client = &http.Client{Timeout: 10 * time.Second}
+				miner.exists = false
+				miner.power_target = 0 // was this: normal_consumption
+				miner.last_pause = time.Now()
+				miner.last_pause = miner.last_pause.Add(-1 * time.Hour)
+				miner.last_resume = time.Now()
+				miner.last_resume = miner.last_resume.Add(-1 * time.Hour)
+				//miner.reconnect()
+				//miner.login()
+				//miner.get_current_watt()
+				miners[indexer] = miner
+				indexer++
+			}
+		}
+	}
+	return miners
+}
+
+func get_single_meter(ip *string) float64 {
+	client := http.Client{
+		Timeout: 5 * time.Second,
+	}
+	//r, err := http.Get("http://" + (*ip) + "/api/v1/measurements/p")
+	r, err := client.Get("http://" + (*ip) + "/api/v1/measurements/p")
+	if err != nil {
+		fmt.Println("Can't get power meter data at " + (*ip))
+		return 0
+	}
+	defer r.Body.Close()
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		fmt.Println("Can't get power meter data at " + (*ip))
+		return 0
+	}
+	ind := strings.Index(string(body), "value")
+	var watt float64
+	watt, err = strconv.ParseFloat(string(body)[ind+7:ind+14], 64)
+	if err != nil {
+		fmt.Println("Can't get power meter data at " + (*ip))
+		return 0
+	}
+	return watt
+}
+
+func get_multiple_meter(s *[meters_length]string) float64 {
+	power := 0.0
+	for i := 0; i < len(*s); i++ {
+		power += get_single_meter(&(*s)[i])
+	}
+	return power
+}
+
+func get_date() string {
+	date_string := time.Now().Format(time.RFC3339)
+	date_string = date_string[:13] + "_" + date_string[14:16] + "_" + date_string[17:19]
+	return date_string
+}
+
+func document_multiple_meter_go(s *[meters_length]string, ms int64) {
+	fi, err := os.Create(get_date() + ".txt")
+	if err != nil {
+		fmt.Println("couldn't open")
+		return
+	}
+	var time_steps int64 = 100
+	var counter int64 = 1
+	var ms_since int64 = 0
+	//ms_since = time.Now().UnixMilli()
+	start := time.Now()
+	//  + "," + strconv.FormatFloat(get_hz(&meters[0]), 'f', -1, 64)
+	for ms_since < ms {
+		fi.WriteString(strconv.Itoa(int(ms_since)) + "," + strconv.Itoa(int(get_multiple_meter(s))) + "\n")
+		time.Sleep(time.Duration(counter*time_steps-ms_since) * time.Millisecond)
+		ms_since = time.Since(start).Milliseconds() // time.Now().UnixMilli() //time.Since(start).Milliseconds()
+		counter++
+	}
+	err = fi.Close()
+	if err != nil {
+		fmt.Println("couldn't close")
+	}
+}
+
+func send_email_if_fcr_activation(from string, password string, to []string, message []byte) {
+	smtpHost := "smtp.gmail.com"
+	smtpPort := "587"
+	auth := smtp.PlainAuth("", from, password, smtpHost)
+	err := smtp.SendMail(smtpHost+":"+smtpPort, auth, from, to, message)
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+var (
+	speed   string
+	power   int
+	minimum int
+)
+
+func main() {
+	flag.StringVar(&speed, "s", "slow", "the speed mode how fast to turn on/off miners")
+	flag.IntVar(&power, "p", -1, "power level to set to")
+	flag.IntVar(&minimum, "m", 30, "minimum miners to keep running per container")
+	flag.Parse()
+	if power == -1 {
+		panic("no power level to set to")
+	}
+	f, err := os.OpenFile("log.txt", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	defer f.Close()
+
+	log.SetOutput(f)
+	log.Println("Logging will start now")
+	meter_killswitch := true
+	//update_killswitch := true
+	//handle_reds_killswitch := true
+	//handle_paused_killswitch := true
+	//check_paused := true
+	fmt.Println("change freq")
+	fmt.Println(get_multiple_meter(&meters))
+	fmt.Println(calc_watt_fcrd_up_response_with_minimum(50, 10000, 500))
+	fmt.Println(calc_watt_fcrd_up_response_with_minimum(49.9, 10000, 500))
+	fmt.Println(calc_watt_fcrd_up_response_with_minimum(49.8, 10000, 500))
+	fmt.Println(calc_watt_fcrd_up_response_with_minimum(49.7, 10000, 500))
+	fmt.Println(calc_watt_fcrd_up_response_with_minimum(49.6, 10000, 500))
+	fmt.Println(calc_watt_fcrd_up_response_with_minimum(49.5, 10000, 500))
+	fmt.Println(calc_watt_fcrd_up_response_with_minimum(49.4, 10000, 500))
+	//for time.Now().Hour() <= 14 && time.Now().Minute() <= 35 {
+	//	if time.Now().Hour() == 14 && time.Now().Minute() == 32 {
+	//		fmt.Println("finally so spät")
+	//		break
+	//	}
+	//}
+	fmt.Println(calc_watt_fcrd_down_response_with_minimum(50.0, 10000, 500))
+	fmt.Println(calc_watt_fcrd_down_response_with_minimum(50.1, 10000, 500))
+	fmt.Println(calc_watt_fcrd_down_response_with_minimum(50.2, 10000, 500))
+	fmt.Println(calc_watt_fcrd_down_response_with_minimum(50.3, 10000, 500))
+	fmt.Println(calc_watt_fcrd_down_response_with_minimum(50.4, 10000, 500))
+	fmt.Println(calc_watt_fcrd_down_response_with_minimum(50.5, 10000, 500))
+	fmt.Println(calc_watt_fcrd_down_response_with_minimum(50.6, 10000, 500))
+	fmt.Println(time.Now().Hour(), " ", time.Now().Minute())
+	last_pause := time.Now()
+	last_pause = last_pause.Add(-1 * time.Hour)
+	fmt.Println(time.Since(last_pause).Seconds())
+	fmt.Println(time.Now().Format("yyyyMMdd'T'HHmmss.SSS"))
+	fmt.Println(time.Now().Unix())
+	fmt.Println(time.Now().UnixMilli())
+	fmt.Println(strconv.FormatFloat(50.1, 'f', -1, 64))
+	//var watt float64
+	body_string := "{\"context\":\"/api/v1/measurements\",\"timestamp\":\"2024-07-25T08:32:59Z\",\"items\":[{\"href\":\"/api/v1/measurements/f\",\"id\":\"f\",\"name\":\"f\",\"value\":50.026,\"unit\":\"Hz\",\"description\":\"Frequency\"},{\"href\":\"/api/v1/measurements/u1\",\"id\":\"u1\",\"name\":\"U1\",\"value\":236.448,\"unit\":\"V\",\"description\":\"Effective value voltage U1\"},{\"href\":\"/api/v1/measurements/u2\",\"id\":\"u2\",\"name\":\"U2\",\"value\":236.598,\"unit\":\"V\",\"description\":\"Effective value voltage U2\"},{\"href\":\"/api/v1/measurements/u3\",\"id\":\"u3\",\"name\":\"U3\",\"value\":236.235,\"unit\":\"V\",\"description\":\"Effective value voltage U3\"},{\"href\":\"/api/v1/measurements/u12\",\"id\":\"u12\",\"name\":\"U12\",\"value\":409.642,\"unit\":\"V\",\"description\":\"Effective value voltage U12\"},{\"href\":\"/api/v1/measurements/u23\",\"id\":\"u23\",\"name\":\"U23\",\"value\":409.670,\"unit\":\"V\",\"description\":\"Effective value voltage U23\"},{\"href\":\"/api/v1/measurements/u31\",\"id\":\"u31\",\"name\":\"U31\",\"value\":409.195,\"unit\":\"V\",\"description\":\"Effective value voltage U31\"},{\"href\":\"/api/v1/measurements/i1\",\"id\":\"i1\",\"name\":\"I1\",\"value\":94.850,\"unit\":\"A\",\"description\":\"Effective value current I1\"},{\"href\":\"/api/v1/measurements/i2\",\"id\":\"i2\",\"name\":\"I2\",\"value\":143.635,\"unit\":\"A\",\"description\":\"Effective value current I2\"},{\"href\":\"/api/v1/measurements/i3\",\"id\":\"i3\",\"name\":\"I3\",\"value\":79.741,\"unit\":\"A\",\"description\":\"Effective value current I3\"},{\"href\":\"/api/v1/measurements/in\",\"id\":\"in\",\"name\":\"IN\",\"value\":85.390,\"unit\":\"A\",\"description\":\"Effective value current IN\"},{\"href\":\"/api/v1/measurements/p1\",\"id\":\"p1\",\"name\":\"P1\",\"value\":12183.146,\"unit\":\"W\",\"description\":\"Active power with sign on phase 1. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/p2\",\"id\":\"p2\",\"name\":\"P2\",\"value\":27147.879,\"unit\":\"W\",\"description\":\"Active power with sign on phase 2. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/p3\",\"id\":\"p3\",\"name\":\"P3\",\"value\":7626.929,\"unit\":\"W\",\"description\":\"Active power with sign on phase 3. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/q1\",\"id\":\"q1\",\"name\":\"Q1\",\"value\":-18828.047,\"unit\":\"var\",\"description\":\"Reactive power with sign on phase 1. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/q2\",\"id\":\"q2\",\"name\":\"Q2\",\"value\":-20438.176,\"unit\":\"var\",\"description\":\"Reactive power with sign on phase 2. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/q3\",\"id\":\"q3\",\"name\":\"Q3\",\"value\":-17217.918,\"unit\":\"var\",\"description\":\"Reactive power with sign on phase 3. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/s1\",\"id\":\"s1\",\"name\":\"S1\",\"value\":22427.160,\"unit\":\"VA\",\"description\":\"Apparent power on phase 1 (unsigned)\"},{\"href\":\"/api/v1/measurements/s2\",\"id\":\"s2\",\"name\":\"S2\",\"value\":33982.207,\"unit\":\"VA\",\"description\":\"Apparent power on phase 2 (unsigned)\"},{\"href\":\"/api/v1/measurements/s3\",\"id\":\"s3\",\"name\":\"S3\",\"value\":18833.031,\"unit\":\"VA\",\"description\":\"Apparent power on phase 3 (unsigned)\"},{\"href\":\"/api/v1/measurements/pf1\",\"id\":\"pf1\",\"name\":\"PF1\",\"value\":0.543,\"unit\":\" \",\"description\":\"Power factor on phase 1 acc. to IEEE: with sign >0: Demand <0: Delivery acc. to IEC: unsigned\"},{\"href\":\"/api/v1/measurements/pf2\",\"id\":\"pf2\",\"name\":\"PF2\",\"value\":0.799,\"unit\":\" \",\"description\":\"Power factor on phase 2 acc. to IEEE: with sign >0: Demand <0: Delivery acc. to IEC: unsigned\"},{\"href\":\"/api/v1/measurements/pf3\",\"id\":\"pf3\",\"name\":\"PF3\",\"value\":0.405,\"unit\":\" \",\"description\":\"Power factor on phase 3 acc. to IEEE: with sign >0: Demand <0: Delivery acc. to IEC: unsigned\"},{\"href\":\"/api/v1/measurements/p\",\"id\":\"p\",\"name\":\"P\",\"value\":46957.957,\"unit\":\"W\",\"description\":\"Sum of active power according to DIN EN 61557-12 with sign. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/q\",\"id\":\"q\",\"name\":\"Q\",\"value\":-56484.141,\"unit\":\"var\",\"description\":\"Vectorial total reactive power according to DIN EN 61557-12 with sign as sum of the individual reactive powers. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/s\",\"id\":\"s\",\"name\":\"S\",\"value\":73452.813,\"unit\":\"VA\",\"description\":\"Vectorial total apparent power according to DIN EN 61557-12 with sign. >0: Demand <0: Delivery\"},{\"href\":\"/api/v1/measurements/pf\",\"id\":\"pf\",\"name\":\"PF\",\"value\":0.639,\"unit\":\" \",\"description\":\"Vectorial total power factor with sign according to IEEE. >0: Inductive <0: Capacitive\"}]}"
+	ind := 3300 + strings.Index(body_string[3300:], "/p\"")
+	watt, err := strconv.ParseFloat(body_string[ind+32:ind+39], 64)
+	if err != nil {
+		fmt.Println("Can't convert power meter data at ")
+		return
+	}
+	fmt.Println(watt)
+	//client := &http.Client{}
+	//var jsonStr = []byte(`{"type": "pause", "params": {"mode": "fast"}}`)
+	//req, err := http.NewRequest("POST", "http://10.100.62.97/kaonsu/v1/curtailment", bytes.NewBuffer(jsonStr))
+	//req.Header.Set("accept", "application/json")
+	//req.Header.Set("Content-Type", "application/json")
+	//resp, err := client.Do(req)
+	//defer resp.Body.Close()
+	//body, err := ioutil.ReadAll(resp.Body)
+	//if err != nil {
+	//	fmt.Println("Error reading response", err.Error())
+	//	return
+	//}
+	//fmt.Println("Response\n", string(body))
+	fmt.Println(make_positive_float_over_length("1233.12ab", 1))
+	var first_from = []int{}
+	var first_to = []int{}
+	var second_from = []int{}
+	var second_to = []int{}
+	if Boden {
+		first_from = []int{100, 62} // 100 40
+		first_to = []int{151, 63}   // 151 71
+		second_from = []int{1, 1}
+		second_to = []int{255, 255}
+	} else {
+		first_from = []int{80} // 100 40
+		first_to = []int{95}   // 151 71
+		second_from = []int{1}
+		second_to = []int{255}
+	}
+
+	miners := create_mara_miners_slice(first_from, first_to, second_from, second_to)
+	var fcr MaraManager
+	fcr.miner_slice = miners
+
+	fmt.Println("update_existing")
+	fmt.Println("change freq Nr. 54")
+	time.Sleep(5 * time.Second)
+	start := time.Now()
+	fcr.update_existing()
+	fcr.get_miner_names()
+	fcr.get_miner_config()
+	var counter int64 = 0
+	for i := 0; i < len(fcr.miner_slice); i++ {
+		if fcr.miner_slice[i].exists {
+			counter++
+		}
+	}
+	fmt.Println("there are ", counter, " miners")
+	fcr.get_status()
+	fcr.update_status()
+	fmt.Println("got status")
+	fmt.Println("Time passed for update existing", time.Since(start))
+
+	//indices := make([]int, len(fcr.miner_slice))
+	//for i := 0; i < len(indices); i++ {
+	//	go fcr.miner_slice[i].resume_go_without()
+	//}
+	//fmt.Println("should resume all NOW")
+	for i := 0; i < len(fcr.miner_slice); i++ {
+		if fcr.miner_slice[i].exists {
+			fmt.Println(fcr.miner_slice[i].ip_address, " ", fcr.miner_slice[i].status, " ", fcr.miner_slice[i].power_target, " ", fcr.miner_slice[i].average_hash, " ", fcr.miner_slice[i].miner_name, " ", fcr.miner_slice[i].target_select, " ", fcr.miner_slice[i].overclocking_percent)
+		}
+	}
+	counter = 0
+	for i := 0; i < len(fcr.miner_slice); i++ {
+		if fcr.miner_slice[i].exists {
+			counter++
+		}
+	}
+	//main.(*MaraMiner).resume_go(0xc0002ae548, 0xc00f7b0000?)
+	//        C:/Users/aaron/GolandProjects/proto_test/grpc-go/examples/testing_functions/main.go:505 +0xae
+	//created by main.(*MaraManager).resume_by_ind in goroutine 1
+	//        C:/Users/aaron/GolandProjects/proto_test/grpc-go/examples/testing_functions/main.go:828 +0x5c
+	fmt.Println("there are ", counter, " miners")
+	fmt.Println(fcr.sum_average_hash())
+	fmt.Println(fcr.sum_average_watt())
+	//meters := []string{"192.168.0.28"}
+	fmt.Println("start tracking")
+	fmt.Println(fcr.paused_ind)
+	fmt.Println(fcr.normal_ind)
+	//fcr.set_consumption(350000)
+	//fmt.Println(get_multiple_meter(&meters))
+	//time.Sleep(150 * time.Second)
+	//fmt.Println(fcr.paused_ind)
+	//fmt.Println(fcr.normal_ind)
+	//fcr.set_consumption(0)
+	//time.Sleep(10 * time.Second)
+	//fcr.set_consumption(350000)
+	//fmt.Println(fcr.paused_ind)
+	//fmt.Println(fcr.normal_ind)
+	//fcr.comply_with_minimum(25)
+	//fcr.pause_by_container(13, 40)
+	//fcr.set_consumption(6000000)
+	//time.Sleep(120 * time.Second)
+	//fcr.set_consumption(0)
+	//time.Sleep(120 * time.Second)
+	fcr.meters.ips = meters
+	fcr.meters.inform_for_fcrd_up = true
+	fcr.meters.inform_for_fcrd_down = true
+	fcr.meters.informed_fcrd_up = false
+	fcr.meters.informed_fcrd_down = false
+	time.Sleep(20 * time.Second)
+	go fcr.meters.start_tracking_and_document(&meter_killswitch)
+	//go fcr.update_not_exisiting_go(&update_killswitch)
+	//go fcr.handle_reds(&handle_reds_killswitch, 6)
+	//go fcr.check_resumed(&handle_paused_killswitch, &check_paused)
+
+	time.Sleep(1 * time.Second)
+	//fmt.Println("meters:", fcr.meters.watt_now_meter(1), fcr.meters.watt_now_meter(2), fcr.meters.watt_now_meter(3), fcr.meters.watt_now_meter(4), fcr.meters.watt_now_meter(5), fcr.meters.watt_now_meter(6), fcr.meters.watt_now_meter(7), fcr.meters.watt_now_meter(8), fcr.meters.watt_now_meter(9), fcr.meters.watt_now_meter(10), fcr.meters.watt_now_meter(11), fcr.meters.watt_now_meter(12), fcr.meters.watt_now_meter(13))
+	fmt.Println("meters:", fcr.meters.watt_now_meter(1), fcr.meters.watt_now_meter(2), fcr.meters.watt_now_meter(3))
+	if speed == "slow" {
+		fcr.set_consumption_distributed_containers_slow(float64(power), int64(minimum))
+		return
+	}
+	if speed == "fast" {
+		fcr.set_consumption_distributed_containers(float64(power), int64(minimum))
+		return
+	}
+
+	//fmt.Println("will test FFR")
+	//fcr.test_ffr_simple(4000, "10.100.3.36")
+	/*
+		t := time.Now()
+		execute_time := time.Date(2025, 1, 23, 15, 0, 10, 0, time.Local)
+		for t.Before(execute_time) {
+			time.Sleep(1 * time.Second)
+			t = time.Now()
+			fmt.Println("Time till execution: ", execute_time.Sub(t).Seconds(), " seconds")
+		}
+		fcr.update_existing()
+		time.Sleep(5 * time.Second)
+		fcr.set_consumption_distributed_containers_slow(1700000, int64(minimum))
+
+	*/
+	/*
+		execute_time = time.Date(2025, 1, 20, 11, 55, 0, 0, time.Local)
+		for t.Before(execute_time) {
+			time.Sleep(1 * time.Second)
+			t = time.Now()
+			fmt.Println("Time till execution: ", execute_time.Sub(t).Seconds(), " seconds")
+		}
+		fcr.update_existing()
+		time.Sleep(5 * time.Second)
+		fcr.set_consumption_distributed_containers_slow(2100000, int64(minimum))
+	*/
+
+	//store("stop_it.txt", "1")
+	//for read_file("stop_it.txt")[0] == '1' {
+	//	time.Sleep(1 * time.Second)
+	//}
+
+	//fcr.test_ffr_2(0.80)
+	//fmt.Println("transformers", fcr.meters.transformer_load(1), fcr.meters.transformer_load(2), fcr.meters.transformer_load(3), fcr.meters.transformer_load(4), fcr.meters.transformer_load(5), fcr.meters.transformer_load(6))
+	//fmt.Println("transformers", fcr.meters.transformer_load(1))
+	//fcr.test_mfrr_down_slow(14000000, 0)
+	//fcr.set_consumption_distributed_containers_slow(14000000, 0)
+	//fcr.set_consumption_distributed_containers_slow(0, 40)
+	//fcr.test_static_fcrd_down_ramp_response(13000000, 500000, (13000000-500000)/240000)
+	//fcr.set_consumption_distributed_containers_slow(14000000, 0)
+	//t1 := time.Now()
+	//fcr.update_overclocking()
+	//fmt.Println("updating overclocking", time.Since(t1).Nanoseconds())
+	//fmt.Println(fcr.percent_len)
+	//time.Sleep(20 * time.Second)
+	//fcr.set_consumption(2200000)
+	//time.Sleep(5 * time.Minute)
+	//fcr.update_existing()
+	//fcr.get_status()
+	//fcr.update_status()
+	//time.Sleep(20 * time.Second)
+	//fcr.overclock_percent(fcr.normal_ind, 10)
+	//time.Sleep(60 * time.Minute)
+	//fcr.update_existing()
+	//fcr.get_status()
+	//fcr.update_status()
+	//time.Sleep(5 * time.Minute)
+	//fcr.test_ffr(0.84)
+	//time.Sleep(10 * time.Second)
+	//fcr.update_existing()
+	//fcr.get_status()
+	//fcr.update_status()
+	//fcr.set_consumption(2200000)
+
+	//time_0 := time.Now()
+	//fmt.Println("time_0", time_0.UnixMilli())
+	//fcr.set_consumption(0)
+	//time.Sleep(5 * time.Minute)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(2200000)
+	//time.Sleep(5 * time.Minute)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.overclock_percent(fcr.normal_ind, 0)
+	//time.Sleep(60 * time.Minute)
+	//time_1 := time.Now()
+	//fmt.Println("time_1", time_1.UnixMilli())
+	//fcr.set_consumption(0)
+	//time.Sleep(5 * time.Minute)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(2200000)
+	//time.Sleep(5 * time.Minute)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.overclock_percent(fcr.normal_ind, -8)
+	//time.Sleep(60 * time.Minute)
+	//time_2 := time.Now()
+	//fmt.Println("time_2", time_2.UnixMilli())
+	//fcr.set_consumption(0)
+	//time.Sleep(5 * time.Minute)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(2200000)
+	//time.Sleep(60 * time.Minute)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//time_3 := time.Now()
+	//fmt.Println("time_3", time_3.UnixMilli())
+	//fcr.set_consumption(0)
+	//time.Sleep(5 * time.Minute)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(2200000)
+	//fcr.overclock_percent(fcr.normal_ind, 8)
+	////fmt.Println("time_0", time_0.UnixMilli())
+	//fmt.Println("time_1", time_1.UnixMilli())
+	//fmt.Println("time_2", time_2.UnixMilli())
+	//fmt.Println("time_3", time_3.UnixMilli())
+	//fcr.overclock_percent_slow(100, fcr.normal_ind, 8)
+	//fcr.set_max_prct_slow(100,8)
+	//fcr.add_consumption_overclock_perc_site_slowly(100, 100000)
+	//fcr.keep_consumption_minimum_slow(11700000, 3*3600000, 10, 30000, 0.02, 50)
+	//
+	//t := time.Now()
+	//execute_time := time.Date(2024, 12, 4, 6, 0, 0, 0, time.Local)
+	//for t.Before(execute_time) {
+	//	time.Sleep(1 * time.Second)
+	//	t = time.Now()
+	//	fmt.Println("Time till execution: ", execute_time.Sub(t).Seconds(), " seconds")
+	//}
+	//fcr.update_existing()
+	//fcr.set_consumption_distributed_containers_slow(400000, minimum)
+	////fmt.Println("comply with minimum")
+	////fcr.comply_with_minimum(25)
+	//time.Sleep(120 * time.Second)
+	//fcr.keep_consumption_minimum_slow(400000, 2*3600000-120, 10, 30000, 0.02, minimum)
+	//t = time.Now()
+	//execute_time = time.Date(2024, 12, 4, 9, 0, 0, 0, time.Local)
+	//for t.Before(execute_time) {
+	//	time.Sleep(1 * time.Second)
+	//	t = time.Now()
+	//	fmt.Println("Time till execution: ", execute_time.Sub(t).Seconds(), " seconds")
+	//}
+	//fcr.set_consumption_distributed_containers_slow(2000000, minimum)
+	////fmt.Println("comply with minimum")
+	////fcr.comply_with_minimum(25)
+	//time.Sleep(120 * time.Second)
+	//fcr.keep_consumption_minimum_slow(2000000, 12*3600000-120, 10, 30000, 0.02, minimum)
+	//t = time.Now()
+	//execute_time = time.Date(2024, 11, 28, 12, 0, 0, 0, time.Local)
+	//for t.Before(execute_time) {
+	//	time.Sleep(1 * time.Second)
+	//	t = time.Now()
+	//	fmt.Println("Time till execution: ", execute_time.Sub(t).Seconds(), " seconds")
+	//}
+	//fcr.set_consumption_distributed_containers_slow(11700000, minimum)
+	////fmt.Println("comply with minimum")
+	////fcr.comply_with_minimum(25)
+	//time.Sleep(120 * time.Second)
+	//fcr.keep_consumption_minimum_slow(11700000, 12*3600000-120, 10, 30000, 0.02, minimum)
+
+	//fcr.set_consumption(2900000)
+	//time.Sleep(120 * time.Second)
+	//ConsumptionManager{}
+	//fcr.resume_by_container(1, 300)
+	//time.Sleep(210)
+	//fcr.pause_by_container(1, 300)
+	//time.Sleep(23)
+	//fcr.resume_by_container(1, 300)
+	//time.Sleep(210)
+	//fcr.test_mfrr_up(2200000, 40000)
+	//fcr.test_mfrr_up(2200000, 1100000)
+	//fcr.set_consumption(2200000)
+	//time.Sleep(100 * time.Second)
+	//fcr.test_mfrr_down(2200000, 40000)
+	//fcr.test_mfrr_down(2200000, 1100000)
+	//fcr.test_static_linearity(2050000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), (2050000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/360000)
+	//fcr.test_static_fcrd_up_ramp_response(2050000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), (2050000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/240000)
+	//fcr.test_mfrr_up(2050000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))
+	//time.Sleep(100 * time.Second)
+	//fcr.test_mfrr_up(float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind))+1025000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))
+	//fcr.set_consumption(0)
+	//time.Sleep(100 * time.Second)
+	//fcr.test_mfrr_down(2050000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))
+	//time.Sleep(100 * time.Second)
+	//fcr.test_mfrr_down(float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind))+1025000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))
+	//time.Sleep(100 * time.Second)
+	//fcr.set_consumption(2050000)
+	//fcr.fcrn_sinus(2130000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), 300000, 1200000, (2060000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/60000)
+	//time.Sleep(120 * time.Second)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(1100000)
+	//time.Sleep(120 * time.Second)
+	//fcr.fcrn_sinus(2130000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), 120000, 1200000, (2060000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/60000)
+	//time.Sleep(120 * time.Second)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(1100000)
+	//time.Sleep(120 * time.Second)
+	//fcr.fcrn_sinus(2130000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), 60000, 1200000, (2060000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/60000)
+	//time.Sleep(120 * time.Second)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(1100000)
+	//time.Sleep(120 * time.Second)
+	//fcr.fcrn_sinus(2130000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), 30000, 1200000, (2060000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/60000)
+	//time.Sleep(120 * time.Second)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(1100000)
+	//time.Sleep(120 * time.Second)
+	//fcr.fcrn_sinus(2130000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), 20000, 1200000, (2060000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/60000)
+	//time.Sleep(120 * time.Second)
+	//fcr.update_existing()
+	//time.Sleep(1 * time.Second)
+	//fcr.set_consumption(1100000)
+	//time.Sleep(120 * time.Second)
+	//fcr.fcrn_sinus(2130000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), 10000, 1200000, (2060000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/60000)
+
+	//fcr.overclock_percent(fcr.normal_ind[:100], 8)
+	//time.Sleep(120 * time.Second)
+	//fcr.set_consumption(2300000)
+	//time.Sleep(240 * time.Second)
+	//fcr.set_consumption(12050000)
+	//time.Sleep(240 * time.Second)
+	//fcr.set_consumption(6050000)
+	//time.Sleep(240 * time.Second)
+	//fcr.set_consumption(0)
+	//time.Sleep(300 * time.Second)
+	//fcr.
+	//time.Sleep(20 * time.Second)
+	//fcr.static_mfrrcm_down(12050000, float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)), 3610000, (12050000-float64(paused_consumption)*float64(len(fcr.paused_ind)+len(fcr.normal_ind)))/360000)
+	//fcr.static_fcr
+	// 1731609569296,1931251,50.008,1
+	// 1731610569153,1928226,50.07,1
+
+	//fmt.Println(time.Now().UnixMilli())
+	//fcr.set_consumption(0)
+	//time.Sleep(150 * time.Second)
+	//fmt.Println(time.Now().UnixMilli())
+	//fcr.set_consumption(2100000)
+	//time.Sleep(150 * time.Second)
+	//fmt.Println(get_multiple_meter(&meters))
+	//fmt.Println(fcr.paused_ind)
+	//fcr.resume_by_container(11, 400)
+
+	//fcr.set_consumption(200000)
+
+	//fcr.overclock_freq_vol(fcr.normal_ind[200:300], 650, 14.3)
+	//fcr.overclock_percent(fcr.normal_ind, 1.7)
+	//go document_multiple_meter_go(&meters, 20000)
+	//fcr.pause_by_name(fcr.normal_ind[:50], "Antminer S19j Pro")
+	//fcr.print_how_many_types()
+	//time.Sleep(20 * time.Second)
+	/*
+		go document_multiple_meter_go(&meters, 20000)
+		fmt.Println("setting consumption")
+		fcr.set_consumption(400000)
+		time.Sleep(20 * time.Second)
+		go document_multiple_meter_go(&meters, 20000)
+		fmt.Println("setting consumption")
+		fcr.set_consumption(0)
+		time.Sleep(20 * time.Second)*/
+	//to := []string{"Schadedaniel9@gmail.com", "aaronhoehnberg@gmail.com"}
+	//message := []byte("To: schadedaniel9@gmail.com\r\naaronhoehnberg@gmail.com\r\n" +
+	//	"Subject: FCR Automated Power Breach Message\r\n" +
+	//	"\r\n" + "This is just a test\r\n")
+	////"The power meter has shown a power consumption of " + strconv.FormatFloat(fcr., 'f', -1, 64) + "\r\n")
+	////iozu rzwe krzg mlss
+	////"1.4142135623"
+	//send_email_if_fcr_activation("fcrroottwo@gmail.com", "iozurzwekrzgmlss", to, message)
+	meter_killswitch = false
+	//update_killswitch = false
+	//handle_reds_killswitch = false
+	//handle_paused_killswitch = false
+	//check_paused = false
+	time.Sleep(1 * time.Second)
+}
